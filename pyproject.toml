@@ -1,0 +1,18 @@
+[project]
+name = "udma-test-review-agent"
+version = "0.1.0"
+description = "udma 自动化测试评审智能体（基于 langgraph）"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=1.0.0",
+    "langchain-core",
+    "langchain-openai",
+    "langgraph-checkpoint-sqlite",
+    "pydantic>=2.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = {find = {where = ["src"]}}

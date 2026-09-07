@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>udma · 代码评审智能体</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg:#f4f6fb; --surface:#ffffff; --surface-2:#f7f9fd; --border:#eaeef6;
+    --text:#17203a; --muted:#7a87a0; --primary:#5b5bd6; --primary-2:#7c6cf0;
+    --done:#2fbf71; --warn:#e6a23c; --err:#f2605f; --info:#4a9eff;
+    --radius:18px; --radius-s:12px;
+    --shadow:0 1px 2px rgba(23,32,58,.04), 0 10px 30px rgba(23,32,58,.05), 0 30px 60px rgba(23,32,58,.04);
+    --shadow-soft:0 6px 20px rgba(23,32,58,.06);
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { margin:0; font-family:"Avenir Next","Nunito","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    background:
+      radial-gradient(1200px 500px at 85% -10%, rgba(124,108,240,.10), transparent 60%),
+      radial-gradient(900px 420px at -10% 10%, rgba(74,158,255,.10), transparent 55%),
+      linear-gradient(180deg,#fafbfe,var(--bg));
+    color:var(--text); font-size:13.5px; line-height:1.5;
+    -webkit-font-smoothing:antialiased; letter-spacing:.1px; }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:#d7deea; border-radius:99px; border:2px solid transparent; background-clip:content-box; }
+  ::-webkit-scrollbar-thumb:hover { background:#bcc7d9; background-clip:content-box; border:2px solid transparent; }
+
+  /* ---------- 顶栏 ---------- */
+  header { display:flex; gap:12px; align-items:center; padding:12px 20px; flex-wrap:wrap;
+    background:rgba(255,255,255,.82); backdrop-filter:blur(14px) saturate(1.4); position:sticky; top:0; z-index:20;
+    border-bottom:1px solid var(--border); }
+  .brand { display:flex; align-items:center; gap:10px; margin-right:8px; }
+  .brand .logo { width:22px; height:22px; border-radius:8px;
+    background:linear-gradient(140deg,#7c6cf0,#5b5bd6 60%,#4a9eff); box-shadow:0 4px 12px rgba(91,91,214,.35); }
+  .brand b { font-size:15px; font-weight:700; letter-spacing:.2px; }
+  .brand small { color:var(--muted); font-weight:500; margin-left:4px; font-size:12px; }
+  .field { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12.5px; }
+  input[type=text], select { background:var(--surface); color:var(--text); border:1px solid var(--border);
+    border-radius:12px; padding:8px 12px; font-size:13px; font-family:inherit; outline:none;
+    transition:border .2s, box-shadow .2s, transform .2s; }
+  input[type=text]:focus, select:focus { border-color:#b9b4f5; box-shadow:0 0 0 4px rgba(91,91,214,.12); }
+  input[type=text]:hover, select:hover { border-color:#d5dcff; }
+  #project { width:240px; }
+  #module { width:120px; }
+  .check { display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:var(--muted); font-size:12.5px; }
+  .check input { accent-color:var(--primary); }
+  .btn { border:1px solid transparent; border-radius:999px; padding:8px 18px; font-size:13px; cursor:pointer;
+    font-family:inherit; font-weight:600; letter-spacing:.2px; transition:all .18s ease; }
+  .btn-primary { background:linear-gradient(135deg,#6d5ef0,#5b5bd6); color:#fff;
+    box-shadow:0 4px 14px rgba(91,91,214,.35); }
+  .btn-primary:hover:not(:disabled) { transform:translateY(-1px); box-shadow:0 8px 20px rgba(91,91,214,.4); }
+  .btn-ghost { background:var(--surface); color:#4b5670; border-color:var(--border); }
+  .btn-ghost:hover:not(:disabled) { background:var(--surface-2); border-color:#d5dcff; color:var(--primary); }
+  .btn-danger { background:var(--surface); color:var(--err); border-color:#fbd7d6; }
+  .btn-danger:hover:not(:disabled) { background:#fff1f1; border-color:#f6b6b5; }
+  .btn:active:not(:disabled) { transform:scale(.97); }
+  .btn:disabled { opacity:.4; cursor:not-allowed; }
+  .spacer { flex:1; }
+  #runStatus { display:inline-flex; align-items:center; gap:8px; padding:6px 16px; border-radius:999px;
+    background:var(--surface); border:1px solid var(--border); color:var(--muted); font-size:12.5px; font-weight:500; }
+  #runStatus::before { content:""; width:8px; height:8px; border-radius:50%; background:#c4cddb; }
+  #runStatus[data-state=running]::before { background:var(--info); animation:pulse 1.6s ease-out infinite; }
+  #runStatus[data-state=paused]::before { background:var(--warn); }
+  #runStatus[data-state=error]::before { background:var(--err); }
+  #runStatus[data-state=done]::before { background:var(--done); }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(74,158,255,.45)} 70%{box-shadow:0 0 0 7px rgba(74,158,255,0)} 100%{box-shadow:0 0 0 0 rgba(74,158,255,0)} }
+
+  /* ---------- 主体布局 ---------- */
+  main { display:grid; grid-template-columns:1fr 400px; height:calc(100vh - 66px); padding:16px; gap:16px; }
+  #graphPane { background:var(--surface); border:1px solid var(--border); border-radius:22px;
+    box-shadow:var(--shadow); overflow:auto; position:relative; }
+  #graphContainer { min-width:100%; min-height:100%; display:flex; justify-content:center; align-items:flex-start; padding:30px; }
+  aside { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:20px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden; }
+  .pane-title { display:flex; align-items:center; gap:9px; padding:13px 18px; border-bottom:1px solid var(--border);
+    font-size:11.5px; font-weight:700; color:var(--muted); letter-spacing:1.4px; }
+  .pane-title .dot { width:7px; height:7px; border-radius:50%; background:linear-gradient(135deg,#7c6cf0,#4a9eff); }
+  #requestBox { height:47%; }
+  #reqContent { flex:1; overflow:auto; padding:14px 18px; white-space:pre-wrap; word-break:break-word;
+    font-family:"SFMono-Regular",ui-monospace,Consolas,monospace; font-size:12px; line-height:1.7; color:#39445e; }
+  #logPane { flex:1; min-height:0; }
+  #logs { flex:1; overflow:auto; padding:10px 16px; font-family:"SFMono-Regular",ui-monospace,Consolas,monospace; font-size:12px; line-height:1.75; }
+  .log-line { padding:2px 8px; border-radius:8px; }
+  .log-line:hover { background:var(--surface-2); }
+  .log-INFO{color:#2b5fc9;} .log-WARNING{color:#a06b12;} .log-ERROR{color:#d63c3c; font-weight:600;}
+  .log-DEBUG{color:#aeb8c8;}
+
+  /* ---------- 悬浮框 ---------- */
+  #tooltip { position:fixed; display:none; z-index:100; max-width:370px; max-height:260px; overflow:auto;
+    background:rgba(255,255,255,.96); backdrop-filter:blur(6px); border:1px solid #dcd7ff; border-radius:16px;
+    padding:12px 16px; font-size:11.5px; white-space:pre-wrap; word-break:break-word; line-height:1.6;
+    font-family:"SFMono-Regular",ui-monospace,Consolas,monospace; box-shadow:0 16px 40px rgba(50,50,110,.18); }
+  #tooltip .tt-title { color:var(--primary); font-weight:700; margin-bottom:7px; font-size:11px; letter-spacing:.6px; }
+
+  /* ---------- 拓扑节点 (mermaid light, 圆润) ---------- */
+  .edgeLabel { color:var(--muted); font-size:10px; font-weight:500; }
+  g.node rect, g.node path.node { rx:16px !important; }
+  g.node.llm rect, g.node.llm path.node { fill:#f0f2ff !important; stroke:#c6c7fa !important; }
+  g.node.tool rect, g.node.tool path.node { fill:#f3f5fa !important; stroke:#dde3ef !important; }
+  g.node.done rect, g.node.done path.node { fill:#e3f8ee !important; stroke:#b1ead0 !important; }
+  g.node.active rect, g.node.active path.node { fill:#fff4dd !important; stroke:#f4c46a !important; stroke-width:2.4px;
+    filter:drop-shadow(0 6px 10px rgba(230,162,60,.35)); }
+  g.node.error rect, g.node.error path.node { fill:#ffeded !important; stroke:#ffc0bf !important; }
+  g.node .nodeLabel, g.node foreignObject div { color:#3a4460 !important; font-weight:600 !important; font-size:12.5px !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo"></span><b>udma <small>代码评审智能体</small></b></div>
+  <label class="field">项目
+    <input id="project" type="text" value="/tmp/opencode/demo_c" placeholder="被测项目路径">
+  </label>
+  <label class="field">模式
+    <select id="mode"><option value="all">全模块串行</option><option value="single">单模块</option></select>
+  </label>
+  <input id="module" type="text" placeholder="目标模块">
+  <label class="check"><input id="clean" type="checkbox">清产物重跑</label>
+  <span class="spacer"></span>
+  <button class="btn btn-primary" id="startBtn">启动</button>
+  <button class="btn btn-ghost" id="pauseBtn" disabled>暂停</button>
+  <button class="btn btn-danger" id="cancelBtn" disabled>停止</button>
+  <button class="btn btn-ghost" id="restartBtn" disabled>重启</button>
+  <span id="runStatus" data-state="idle">空闲</span>
+</header>
+<main>
+  <section id="graphPane">
+    <div id="graphContainer">加载拓扑…</div>
+  </section>
+  <div id="tooltip"></div>
+  <aside>
+    <div class="card" id="requestBox">
+      <div class="pane-title"><span class="dot"></span>当前 LLM 请求</div>
+      <div id="reqContent">等待运行…</div>
+    </div>
+    <div class="card" id="logPane">
+      <div class="pane-title"><span class="dot"></span>日志</div>
+      <div id="logs"></div>
+    </div>
+  </aside>
+</main>
+<script>
+let graphInfo = null;
+const nodeStatus = {};
+const nodeBuffer = {};
+let activeNode = null;
+const tooltip = document.getElementById('tooltip');
+
+async function renderGraph() {
+  mermaid.initialize({ startOnLoad:false, theme:'base', securityLevel:'loose', flowchart:{ curve:'basis', htmlLabels:true },
+    themeVariables:{ background:'transparent', fontSize:'13px', textColor:'#334155', lineColor:'#94a3b8',
+      edgeLabelBackground:'#ffffff', fontFamily:'Inter, system-ui, sans-serif' } });
+  const { svg } = await mermaid.render('mermaidTopology', graphInfo.mermaid);
+  document.getElementById('graphContainer').innerHTML = svg;
+  graphInfo.nodes.forEach(n => {
+    const id = `flowchart-${n}`;
+    let el = document.getElementById(id);
+    if (!el) el = document.querySelector(`g[id^="${id}-"]`);
+    if (el) {
+      el.classList.add(n);
+      el.classList.add(graphInfo.llm_nodes.includes(n) ? 'llm' : 'tool');
+      if (graphInfo.llm_nodes.includes(n)) {
+        el.addEventListener('mouseenter', () => showTip(n, el));
+        el.addEventListener('mouseleave', scheduleHide);
+      }
+    }
+  });
+}
+function applyStatus(name, st) {
+  const id = `flowchart-${name}`;
+  let el = document.getElementById(id);
+  if (!el) el = document.querySelector(`g[id^="${id}-"]`);
+  if (el) { el.classList.remove('done','active','error'); if (st !== 'idle') el.classList.add(st); }
+}
+function showTip(name, nodeEl) {
+  clearTimeout(hideTimer);
+  const box = nodeEl.getBoundingClientRect();
+  const text = nodeBuffer[name] || '';
+  const phase = activeNode === name && currentRequest ? `（${currentRequest.phase || '…'}）` : '';
+  document.getElementById('tooltip').innerHTML =
+    `<div class="tt-title">${name} ${phase}</div>${text.slice(-1600) || '（尚无接收内容）'}`;
+  tooltip.style.display = 'block';
+  tooltip.style.left = Math.min(box.left + box.width + 10, window.innerWidth - 390) + 'px';
+  tooltip.style.top = Math.max(8, box.top) + 'px';
+}
+let hideTimer = null;
+function scheduleHide() {
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => { tooltip.style.display = 'none'; }, 280);
+}
+tooltip.addEventListener('mouseenter', () => clearTimeout(hideTimer));
+tooltip.addEventListener('wheel', e => { if (tooltip.style.display === 'block') e.stopPropagation(); }, { passive: false });
+tooltip.addEventListener('mouseleave', scheduleHide);
+
+let currentRequest = null;
+function renderRequest() {
+  const box = document.getElementById('reqContent');
+  if (!currentRequest) { box.textContent = '等待运行…'; return; }
+  let text = `[${currentRequest.status}] 节点: ${currentRequest.node}\n`;
+  text += `模型: ${currentRequest.model} | schema: ${currentRequest.schema || '—'} | 输入: ${currentRequest.prompt_chars}字\n`;
+  text += `请求摘要: ${currentRequest.prompt_digest}\n`;
+  text += `阶段: ${currentRequest.phase || '—'} | 已收: 思维链 ${(currentRequest.reasoning_chars||0)}字 / 正文 ${(currentRequest.content_chars||0)}字\n`;
+  text += '\n────────────────── 流式接收 ──────────────────\n';
+  text += (currentRequest.stream || '').slice(-1600);
+  box.textContent = text;
+  box.scrollTop = box.scrollHeight;
+}
+
+function appendLog(ev) {
+  const box = document.getElementById('logs');
+  const div = document.createElement('div');
+  div.className = 'log-line log-' + ev.level;
+  div.textContent = ev.msg;
+  box.appendChild(div);
+  while (box.childNodes.length > 400) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+function handle(ev) {
+  switch (ev.type) {
+    case 'node':
+      nodeStatus[ev.name] = ev.status;
+      applyStatus(ev.name, ev.status);
+      if (ev.status === 'start') { activeNode = ev.name; if (!currentRequest) currentRequest = {node:ev.name,status:'运行中'}; }
+      if (ev.status === 'done' && activeNode === ev.name) { activeNode = null; }
+      if (ev.status === 'error') appendLog({level:'ERROR', msg:`节点 ${ev.name} 异常: ${ev.message||''}`});
+      break;
+    case 'llm':
+      if (ev.kind === 'request') {
+        currentRequest = { node: activeNode, status:'生成中', model:ev.model, schema:ev.schema,
+          prompt_digest:ev.prompt_digest, prompt_chars:ev.prompt_chars, phase:'', stream:'',
+          reasoning_chars:0, content_chars:0 };
+        nodeBuffer[activeNode] = '';
+      } else if (ev.kind === 'chunk') {
+        const buf = nodeBuffer[currentRequest.node] = (nodeBuffer[currentRequest.node]||'') + ev.text;
+        if (buf.length > 6000) nodeBuffer[currentRequest.node] = buf.slice(-6000);
+        currentRequest.stream = (currentRequest.stream||'') + ev.text;
+        currentRequest.phase = ev.phase;
+        if (ev.phase === 'reasoning') currentRequest.reasoning_chars += ev.text.length;
+        else currentRequest.content_chars += ev.text.length;
+      } else if (ev.kind === 'done') {
+        currentRequest.status = `完成 ${ev.elapsed}s`;
+        currentRequest.reasoning_chars = ev.reasoning_chars;
+        currentRequest.content_chars = ev.content_chars;
+      }
+      renderRequest();
+      break;
+    case 'log': appendLog(ev); break;
+    case 'run':
+      updateRunUI(ev.status);
+      break;
+  }
+}
+
+function updateRunUI(status) {
+  const running = status === 'running';
+  const paused = status === 'paused';
+  const busy = running || paused;
+  startBtn.disabled = busy;
+  pauseBtn.disabled = !running;
+  pauseBtn.textContent = '暂停';
+  cancelBtn.disabled = !busy;
+  restartBtn.disabled = !hasRun;
+  const st = document.getElementById('runStatus');
+  st.dataset.state = status==='error' ? 'error' : status==='paused' ? 'paused'
+    : status==='running' ? 'running' : status==='done' ? 'done' : 'idle';
+  st.textContent =
+    status === 'running' ? '运行中' : status === 'paused' ? '已暂停' :
+    status === 'cancelled' ? '已取消' : status === 'error' ? '出错' :
+    status === 'done' ? '评审完成' : '空闲';
+}
+const es = new EventSource('/api/events');
+es.onmessage = e => handle(JSON.parse(e.data));
+
+let hasRun = false;
+async function ctl(api) {
+  const resp = await fetch(api, { method: 'POST' });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    appendLog({ level: 'ERROR', msg: '控制失败: ' + (err.detail || resp.status) });
+  }
+}
+
+pauseBtn.addEventListener('click', () => {
+  if (pauseBtn.textContent === '暂停') { pauseBtn.textContent = '继续'; ctl('/api/pause'); }
+  else { ctl('/api/resume'); }
+});
+cancelBtn.addEventListener('click', () => ctl('/api/cancel'));
+restartBtn.addEventListener('click', () => ctl('/api/restart'));
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  startBtn.disabled = true;
+  const payload = { project: document.getElementById('project').value,
+    mode: document.getElementById('mode').value,
+    module: document.getElementById('module').value.trim(),
+    clean: document.getElementById('clean').checked };
+  const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    appendLog({ level: 'ERROR', msg: '启动失败: ' + (err.detail || resp.status) });
+    startBtn.disabled = false;
+  } else {
+    hasRun = true; restartBtn.disabled = false;
+    updateRunUI('running');
+  }
+});
+
+(async () => {
+  const st = await (await fetch('/api/status')).json();
+  updateRunUI(st.status === 'running' || st.status === 'paused' ? st.status : 'idle');
+})();
+
+async function init() {
+  graphInfo = await (await fetch('/api/graph')).json();
+  graphInfo.nodes.forEach(n => { nodeStatus[n] = 'idle'; nodeBuffer[n] = ''; });
+  await renderGraph();
+}
+init();
+</script>
+</body>
+</html>
