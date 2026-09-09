@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from ...log import get_logger
+from ...module_map import id_sort_key
 from ...schemas import (
     CallEdge,
     FunctionInfo,
@@ -109,71 +110,97 @@ def _extract_build_flags(root: Path) -> list[str]:
     return sorted(set(flags))[:100]
 
 
-def _module_name(rel_path: str) -> str:
-    parts = Path(rel_path).parts
-    return parts[0] if len(parts) > 1 else "(root)"
-
-
-def scan_project(project_root: str, small_token_threshold: int) -> ScanResult:
+def scan_project(
+    project_root: str,
+    module_ids: dict[str, str] | None = None,
+) -> ScanResult:
+    """扫描项目为文件级模块；module_ids 为 {相对 .c 路径: 模块标识} 映射。"""
     root = Path(project_root).resolve()
     if not root.is_dir():
         raise ValueError(f"被测项目目录不存在: {root}")
     logger.info("[S0] 扫描项目 %s", root)
+    logger.debug("[S0] 扫描参数 排除目录=%s", sorted(EXCLUDE_DIRS))
 
     source_files = _iter_source_files(root)
+    rel_paths = {str(p.relative_to(root)) for p in source_files}
+    c_paths = sorted(rel for rel in rel_paths if rel.endswith(".c"))
+    logger.debug("[S0] 源码文件数=%d .c文件数=%d", len(source_files), len(c_paths))
+
+    if module_ids is None:
+        module_ids = {rel: f"M{i:02d}" for i, rel in enumerate(c_paths, 1)}
+        logger.debug("[S0] 未提供模块映射，按路径自动编号")
+    else:
+        missing = [rel for rel in c_paths if rel not in module_ids]
+        if missing:
+            raise ValueError(f"以下 .c 文件未在 modules.yaml 中映射: {missing}")
+        scanned = set(c_paths)
+        extra = sorted(rel for rel in module_ids if rel not in scanned)
+        if extra:
+            raise ValueError(f"modules.yaml 映射的路径不在扫描范围内（须为已扫描的 .c）: {extra}")
+
+    texts: dict[str, str] = {}
     functions: list[FunctionInfo] = []
     include_edges: list[IncludeEdge] = []
-    module_map: dict[str, dict] = {}
+    build_flags = _extract_build_flags(root)
 
-    rel_paths = {str(p.relative_to(root)) for p in source_files}
     for path in source_files:
         rel = str(path.relative_to(root))
         text = path.read_text(encoding="utf-8", errors="replace")
-        module = _module_name(rel)
-        info = module_map.setdefault(
-            module,
-            {"path": str(Path(rel).parent) if Path(rel).parent != Path(".") else ".", "files": [], "chars": 0},
-        )
-        info["files"].append(SourceFileInfo(path=rel, lines=text.count("\n") + 1, chars=len(text)))
-        info["chars"] += len(text)
-        functions.extend(_extract_functions(text, rel))
+        texts[rel] = text
+        file_functions = _extract_functions(text, rel)
+        functions.extend(file_functions)
+        logger.debug("[S0] 文件 %s 行=%d 字符=%d 函数=%d", rel, len(text.splitlines()), len(text), len(file_functions))
         for line in text.splitlines():
             include = LOCAL_INCLUDE_RE.match(line)
             if not include:
                 continue
             target = include.group(1)
             candidates = [path.parent / target, root / target]
-            for flag in _extract_build_flags(root):
+            for flag in build_flags:
                 if flag.startswith("-I"):
                     candidates.append(root / flag[2:] / target)
             resolved = next((c.resolve() for c in candidates if c.exists()), None)
             if resolved is None:
+                logger.debug("[S0] include未解析 %s -> %s", rel, target)
                 continue
             dst = str(resolved.relative_to(root))
             if dst in rel_paths:
                 include_edges.append(IncludeEdge(src=rel, dst=dst))
+                logger.debug("[S0] include %s -> %s", rel, dst)
+            else:
+                logger.debug("[S0] include指向项目外 %s -> %s", rel, dst)
 
-    modules = []
-    for name, info in module_map.items():
+    modules: list[ModuleInventory] = []
+    for c_rel in c_paths:
+        header_rel = str(Path(c_rel).with_suffix(".h"))
+        file_rels = [c_rel] + ([header_rel] if header_rel in rel_paths else [])
+        files = [
+            SourceFileInfo(path=rel, lines=len(texts[rel].splitlines()), chars=len(texts[rel]))
+            for rel in file_rels
+        ]
+        chars = sum(len(texts[rel]) for rel in file_rels)
         modules.append(
             ModuleInventory(
-                name=name,
-                path=info["path"],
-                files=info["files"],
-                chars=info["chars"],
-                token_estimate=int(info["chars"] / 3.5),
+                module_id=module_ids[c_rel],
+                name=module_ids[c_rel],
+                path=c_rel,
+                files=files,
+                chars=chars,
+                token_estimate=int(chars / 3.5),
             )
         )
-    modules.sort(key=lambda m: m.name)
+    modules.sort(key=lambda m: id_sort_key(m.module_id))
+    logger.debug(
+        "[S0] 模块清单 %s",
+        [(m.module_id, m.path, len(m.files), m.token_estimate) for m in modules],
+    )
 
     defined = {f.name: f for f in functions}
     call_edges: list[CallEdge] = []
     seen = set()
     for func in functions:
-        path = root / func.file
-        body = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        body_text = "\n".join(body[func.start_line - 1 : func.end_line])
-        for callee, callee_info in defined.items():
+        body_text = "\n".join(texts[func.file].splitlines()[func.start_line - 1 : func.end_line])
+        for callee in defined:
             if callee == func.name:
                 continue
             if re.search(CALL_RE_TMPL.format(name=re.escape(callee)), body_text):
@@ -188,8 +215,9 @@ def scan_project(project_root: str, small_token_threshold: int) -> ScanResult:
         include_graph=include_edges,
         call_graph=call_edges,
         functions=functions,
-        build_flags=_extract_build_flags(root),
+        build_flags=build_flags,
     )
+    logger.debug("[S0] 构建参数=%s 调用边=%d", build_flags, len(call_edges))
     logger.info(
         "[S0] 完成: 模块=%d 文件=%d 函数=%d include边=%d 调用边=%d",
         len(modules),

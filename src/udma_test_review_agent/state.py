@@ -13,6 +13,7 @@ class ReviewState(TypedDict, total=False):
     critical_paths: dict[str, Any]
     cross_module_candidates: list[dict[str, Any]]
     module_order: list[str]
+    module_size: dict[str, Any]
     module_raw: dict[str, Any]
     review_index: int
     module_results: dict[str, Any]

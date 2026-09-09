@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
+import os
 import threading
 import time
 from collections import deque
@@ -19,6 +19,9 @@ from pydantic import BaseModel
 from .configuration import ReviewConfig
 from .control import run_control
 from .graph import graph
+from .log import resolve_level
+from .model_config import load_models_config
+from .versioning import prepare_run
 
 _WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
@@ -32,19 +35,22 @@ MERMAID = """flowchart TD
         merge["S4 汇总校验 · 工具"]
     end
     subgraph loop[模块评审循环]
+        size_analysis["尺寸分析 · 工具"]
         review_module["检视 · LLM"]
         rebuttal_module["反驳 · LLM"]
+        review_check["反驳审查 · 工具"]
+        module_report["模块报告 · LLM"]
         advance["推进 · 工具"]
     end
     scan --> global_arch --> module_archs --> critical_paths --> merge
-    merge --> review_module --> rebuttal_module --> advance
-    advance -->|下一模块| review_module
-    advance -->|全部完成| report["报告 · LLM"]
+    merge --> size_analysis --> review_module --> rebuttal_module --> review_check --> module_report --> advance
+    advance -->|下一模块| size_analysis
+    advance -->|全部完成| report["总报告 · 工具"]
     report --> END([END])
 """
 
-LLM_NODES = ["global_arch", "module_archs", "critical_paths", "review_module", "rebuttal_module", "report"]
-TOOL_NODES = ["scan", "merge", "advance"]
+LLM_NODES = ["global_arch", "module_archs", "critical_paths", "review_module", "rebuttal_module", "module_report"]
+TOOL_NODES = ["scan", "merge", "size_analysis", "review_check", "advance", "report"]
 ALL_NODES = TOOL_NODES + LLM_NODES
 
 
@@ -91,7 +97,9 @@ class _BusHandler(logging.Handler):
 def _attach_log_bus() -> None:
     target = logging.getLogger("udma_test_review_agent")
     if not any(isinstance(h, _BusHandler) for h in target.handlers):
-        target.addHandler(_BusHandler())
+        handler = _BusHandler()
+        handler.setLevel(resolve_level(os.getenv("LOG_LEVEL")))
+        target.addHandler(handler)
 
 
 _attach_log_bus()
@@ -101,9 +109,9 @@ app = FastAPI(title="udma-test-review-agent")
 
 class RunRequest(BaseModel):
     project: str
-    mode: str = "all"
-    module: str = ""
-    small_threshold: int = 30000
+    modules: str = "all"
+    model: str = ""
+    small_line_threshold: int = 2000
     clean: bool = False
 
 
@@ -140,16 +148,13 @@ def start_run(req: RunRequest) -> dict[str, str]:
         try:
             cfg = ReviewConfig(
                 project_root=req.project,
-                mode=req.mode,
-                target_module=req.module,
-                small_module_token_threshold=req.small_threshold,
+                modules=req.modules,
+                model_profile=req.model,
+                small_module_line_threshold=req.small_line_threshold,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if req.clean:
-            output = Path(cfg.output_root)
-            if output.exists():
-                shutil.rmtree(output)
+        prepare_run(cfg.output_root, clean=req.clean)
         last_payload = req.model_dump()
         run_state.update(status="running", message="")
         run_control.start()
@@ -199,17 +204,24 @@ def restart() -> dict[str, str]:
         payload = dict(last_payload)
         cfg = ReviewConfig(
             project_root=payload["project"],
-            mode=payload["mode"],
-            target_module=payload.get("module", ""),
-            small_module_token_threshold=payload.get("small_threshold", 30000),
+            modules=payload.get("modules", "all"),
+            model_profile=payload.get("model", ""),
+            small_module_line_threshold=payload.get("small_line_threshold", 2000),
         )
-        output = Path(cfg.output_root)
-        if output.exists():
-            shutil.rmtree(output)
+        prepare_run(cfg.output_root, clean=True)
         run_state.update(status="running", message="")
         run_control.start()
         threading.Thread(target=_execute, args=(asdict(cfg),), daemon=True).start()
     return {"status": "started"}
+
+
+@app.get("/api/models")
+def get_models() -> dict[str, Any]:
+    try:
+        cfg = load_models_config()
+    except ValueError as exc:
+        return {"active": "", "models": [], "error": str(exc)}
+    return {"active": cfg.active, "models": [m.name for m in cfg.models]}
 
 
 @app.get("/api/graph")

@@ -16,14 +16,9 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .log import get_logger
+from .model_config import ModelSpec, resolve_model
 
 logger = get_logger(__name__)
-
-DEFAULT_MODEL = "deepseek-chat"
-DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_RETRIES = 2
-DEFAULT_TIMEOUT = 60.0
 
 _OPENCODE_CONFIG_DEFAULT = Path.home() / ".config" / "opencode" / "opencode.json"
 
@@ -41,7 +36,16 @@ def load_deepseek_config(config_path: str | os.PathLike | None = None) -> dict[s
     return {key: options[key] for key in ("apiKey", "baseURL") if options.get(key)}
 
 
+def _resolve_api_key(spec: ModelSpec) -> str:
+    if spec.api_key:
+        return spec.api_key
+    cfg = load_deepseek_config()
+    return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or cfg.get("apiKey", "")
+
+
 def create_llm(
+    profile: str | None = None,
+    *,
     model: str | None = None,
     temperature: float | None = None,
     max_retries: int | None = None,
@@ -49,19 +53,19 @@ def create_llm(
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> BaseChatModel:
-    cfg = load_deepseek_config()
-    resolved_api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or cfg.get("apiKey")
+    spec = resolve_model(profile)
+    resolved_api_key = api_key or _resolve_api_key(spec)
     if not resolved_api_key:
-        raise ValueError("DeepSeek API 密钥缺失：请配置 DEEPSEEK_API_KEY 或 opencode.json 的 provider.deepseek.options.apiKey")
+        raise ValueError(
+            f"模型 {spec.name} 缺少 API Key：请在配置文件的 api_key 填写字面量或 ${{环境变量名}}"
+        )
 
     return ChatOpenAI(
-        model=model or os.getenv("LLM_MODEL", DEFAULT_MODEL),
-        temperature=temperature
-        if temperature is not None
-        else float(os.getenv("LLM_TEMPERATURE", DEFAULT_TEMPERATURE)),
-        max_retries=max_retries or int(os.getenv("LLM_MAX_RETRIES", DEFAULT_MAX_RETRIES)),
-        timeout=timeout or float(os.getenv("LLM_TIMEOUT", DEFAULT_TIMEOUT)),
-        base_url=base_url or os.getenv("DEEPSEEK_BASE_URL") or cfg.get("baseURL") or DEFAULT_BASE_URL,
+        model=model or spec.model,
+        temperature=temperature if temperature is not None else spec.temperature,
+        max_retries=max_retries if max_retries is not None else spec.max_retries,
+        timeout=timeout if timeout is not None else spec.timeout,
+        base_url=base_url or spec.base_url,
         api_key=resolved_api_key,
     )
 
@@ -97,8 +101,6 @@ def generate_text(
 
 # ---------------- LLM 流式调用 (DeepSeek) ----------------
 
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-reasoner")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_FIRST_TOKEN_TIMEOUT = 60.0
 LLM_CHUNK_TIMEOUT = 30.0
 HEARTBEAT_INTERVAL = 5.0
@@ -109,12 +111,36 @@ CLIENT_UA = "udma-test-review-agent/0.1"
 _SESSION_ID = uuid.uuid4().hex
 
 
-def _load_llm_api_key() -> str:
-    key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or ""
-    if key:
-        return key
-    cfg = load_deepseek_config()
-    return cfg.get("apiKey", "")
+def _build_openai_client(spec: ModelSpec, base_url: str, api_key: str) -> OpenAI:
+    headers = dict(spec.extra_headers)
+    if "opencode.ai" in base_url:
+        headers.setdefault("x-opencode-session", _SESSION_ID)
+    headers.setdefault("User-Agent", CLIENT_UA)
+    return OpenAI(api_key=api_key, base_url=base_url, default_headers=headers)
+
+
+_PROVIDERS = {"openai": _build_openai_client}
+
+
+def _build_client(spec: ModelSpec, base_url: str | None = None) -> OpenAI:
+    builder = _PROVIDERS.get(spec.type)
+    if builder is None:
+        raise ValueError(f"不支持的模型类型: {spec.type}，可选: {sorted(_PROVIDERS)}")
+    api_key = _resolve_api_key(spec)
+    if not api_key:
+        raise ValueError(
+            f"模型 {spec.name} 缺少 API Key：请在配置文件的 api_key 填写字面量或 ${{环境变量名}}"
+        )
+    resolved_base_url = base_url or spec.base_url
+    logger.debug(
+        "[客户端] name=%s type=%s base_url=%s 密钥=%s 附加头=%s",
+        spec.name,
+        spec.type,
+        resolved_base_url,
+        "已配置",
+        list(spec.extra_headers),
+    )
+    return builder(spec, resolved_base_url, api_key)
 
 
 def _prompt_digest(text: str) -> str:
@@ -146,7 +172,9 @@ def _extract_json(text: str) -> dict:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
         if start < 0 or end <= start:
+            logger.debug("[JSON提取] 未找到 JSON 对象 chars=%d", len(cleaned))
             raise
+        logger.debug("[JSON提取] 回退截取子串 起=%d 止=%d chars=%d", start, end, end - start + 1)
         return json.loads(cleaned[start : end + 1])
 
 
@@ -174,6 +202,7 @@ def stream_llm_once(
     prompt: str,
     schema: type[BaseModel] | None = None,
     *,
+    profile: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
     first_token_timeout: float = LLM_FIRST_TOKEN_TIMEOUT,
@@ -191,9 +220,12 @@ def stream_llm_once(
     (思维链, 正文) 二元组）；
     schema 为 Pydantic 模型时启用 JSON 结构化输出，返回校验后的实例。
     observer 为可选回调 (kind, data)，接收 request/chunk/done 事件。
+    profile 指定模型配置中的 name；为空时依 LLM_PROFILE 环境变量或配置 active。
     """
-    model = model or LLM_MODEL
-    base_url = base_url or LLM_BASE_URL
+    spec = resolve_model(profile)
+    model = model or spec.model
+    base_url = base_url or spec.base_url
+
     def _notify(kind: str, data: dict) -> None:
         if observer is not None:
             try:
@@ -204,6 +236,16 @@ def stream_llm_once(
     response_format = None
     if schema is not None:
         prompt, response_format = _apply_json_constraint(prompt, schema)
+    logger.debug(
+        "[调用解析] profile=%s model=%s base_url=%s schema=%s response_format=%s include_reasoning=%s prompt_chars=%d",
+        profile or "(active)",
+        model,
+        base_url,
+        schema.__name__ if schema else None,
+        response_format.get("type") if response_format else None,
+        include_reasoning,
+        len(prompt),
+    )
     logger.info(
         "发起调用 model=%s schema=%s prompt_digest=%r prompt_chars=%d "
         "first_token_timeout=%.0fs chunk_timeout=%.0fs",
@@ -223,15 +265,7 @@ def stream_llm_once(
         "chunk_timeout": chunk_timeout,
     })
 
-    client = OpenAI(
-        api_key=_load_llm_api_key(),
-        base_url=base_url,
-        default_headers=(
-            {"x-opencode-session": _SESSION_ID, "User-Agent": CLIENT_UA}
-            if "opencode.ai" in base_url
-            else {"User-Agent": CLIENT_UA}
-        ),
-    )
+    client = _build_client(spec, base_url=base_url)
     events: queue.Queue[tuple[str, object]] = queue.Queue()
 
     def _worker() -> None:
@@ -377,6 +411,7 @@ def stream_llm_once(
 
 
 def _validate_schema_output(text: str, schema: type[BaseModel]) -> BaseModel:
+    logger.debug("[JSON原文] schema=%s chars=%d 截断=%r", schema.__name__, len(text), text[:2000])
     try:
         result = schema.model_validate(_extract_json(text))
     except (json.JSONDecodeError, ValueError) as exc:

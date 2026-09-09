@@ -1,0 +1,54 @@
+# 模型配置文件
+#
+# active: 当前启用的模型 name；亦可用环境变量 LLM_PROFILE 或 CLI/接口参数临时覆盖。
+# models: 模型列表，每项字段说明：
+#   name           唯一名称，供切换时引用
+#   type           模型类型，当前支持 openai（OpenAI 兼容端点）
+#   model          传给供应商的模型标识
+#   base_url       API Base URL
+#   api_key        密钥：可写字面量，或写 ${ENV_VAR} 从环境变量读取，支持 ${ENV_VAR:-默认值}
+#   temperature    采样温度，默认 0.7
+#   max_retries    失败重试次数，默认 2（用于 create_llm）
+#   timeout        请求超时秒数，默认 60（用于 create_llm）
+#   extra_headers  附加请求头（可选）
+#
+# 新增模型：复制一份条目并修改字段即可，无需改动代码。
+
+active: deepseek-v4.1-flash
+
+models:
+  - name: deepseek-v4.1-flash
+    type: openai
+    model: deepseek-v4.1-flash-expires-on-0910
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    temperature: 0.7
+    max_retries: 2
+    timeout: 60
+
+  - name: deepseek-chat
+    type: openai
+    model: deepseek-chat
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    temperature: 0.7
+    max_retries: 2
+    timeout: 60
+
+  - name: deepseek-reasoner
+    type: openai
+    model: deepseek-reasoner
+    base_url: https://api.deepseek.com
+    api_key: ${DEEPSEEK_API_KEY}
+    temperature: 0.7
+    max_retries: 2
+    timeout: 60
+
+  - name: glm-5.3-flash
+    type: openai
+    model: glm-5.3-flash
+    base_url: https://opencode.ai/zen/go/v1
+    api_key: ${OPENCODE_API_KEY}
+    temperature: 0.7
+    max_retries: 2
+    timeout: 60

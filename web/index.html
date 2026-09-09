@@ -42,7 +42,7 @@
   input[type=text]:focus, select:focus { border-color:#b9b4f5; box-shadow:0 0 0 4px rgba(91,91,214,.12); }
   input[type=text]:hover, select:hover { border-color:#d5dcff; }
   #project { width:240px; }
-  #module { width:120px; }
+  #modules { width:170px; }
   .check { display:inline-flex; align-items:center; gap:6px; cursor:pointer; color:var(--muted); font-size:12.5px; }
   .check input { accent-color:var(--primary); }
   .btn { border:1px solid transparent; border-radius:999px; padding:8px 18px; font-size:13px; cursor:pointer;
@@ -112,10 +112,12 @@
   <label class="field">项目
     <input id="project" type="text" value="/tmp/opencode/demo_c" placeholder="被测项目路径">
   </label>
-  <label class="field">模式
-    <select id="mode"><option value="all">全模块串行</option><option value="single">单模块</option></select>
+  <label class="field">模型
+    <select id="model"><option value="">默认</option></select>
   </label>
-  <input id="module" type="text" placeholder="目标模块">
+  <label class="field">模块
+    <input id="modules" type="text" value="all" placeholder="all / M01 / M01-M05">
+  </label>
   <label class="check"><input id="clean" type="checkbox">清产物重跑</label>
   <span class="spacer"></span>
   <button class="btn btn-primary" id="startBtn">启动</button>
@@ -292,8 +294,8 @@ restartBtn.addEventListener('click', () => ctl('/api/restart'));
 document.getElementById('startBtn').addEventListener('click', async () => {
   startBtn.disabled = true;
   const payload = { project: document.getElementById('project').value,
-    mode: document.getElementById('mode').value,
-    module: document.getElementById('module').value.trim(),
+    modules: document.getElementById('modules').value.trim() || 'all',
+    model: document.getElementById('model').value,
     clean: document.getElementById('clean').checked };
   const resp = await fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   if (!resp.ok) {
@@ -311,9 +313,21 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   updateRunUI(st.status === 'running' || st.status === 'paused' ? st.status : 'idle');
 })();
 
+async function loadModels() {
+  const info = await (await fetch('/api/models')).json();
+  const sel = document.getElementById('model');
+  (info.models || []).forEach(name => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name === info.active ? `${name}（默认）` : name;
+    sel.appendChild(opt);
+  });
+}
+
 async function init() {
   graphInfo = await (await fetch('/api/graph')).json();
   graphInfo.nodes.forEach(n => { nodeStatus[n] = 'idle'; nodeBuffer[n] = ''; });
+  await loadModels();
   await renderGraph();
 }
 init();

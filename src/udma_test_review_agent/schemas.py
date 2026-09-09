@@ -19,8 +19,9 @@ class FunctionInfo(BaseModel):
 
 
 class ModuleInventory(BaseModel):
-    name: str = Field(description="模块名，通常为子系统目录名")
-    path: str = Field(description="模块根目录相对路径")
+    module_id: str = Field(default="", description="模块标识，如 M01")
+    name: str = Field(description="模块名，文件级模块取标识")
+    path: str = Field(description="模块主文件相对路径（.c）")
     files: list[SourceFileInfo]
     chars: int
     token_estimate: int
@@ -107,8 +108,14 @@ class ModuleArchitecture(BaseModel):
     domains: list[DomainInfo]
     concurrency_contract: ModuleConcurrencyContract
     checklist: list[ChecklistItem]
+
+
+class ModuleSize(BaseModel):
+    module: str
+    lines: int = Field(description="模块 .c 与 .h 物理行数之和")
+    chars: int = Field(description="模块 .c 与 .h 字符数之和")
     size_class: str = Field(description="small / large")
-    token_estimate: int
+    line_threshold: int = Field(description="规模判定阈值（行）")
 
 
 class PathStep(BaseModel):
@@ -131,9 +138,15 @@ class CriticalPathReport(BaseModel):
 class Finding(BaseModel):
     id: str = Field(description="f1/f2/... 编号")
     category: str = Field(description="memory/concurrency/trust_boundary/resource/logic/macro/ub 之一")
-    severity: str = Field(description="critical/high/medium/low")
+    severity: str = Field(description="提示/一般/严重/致命 之一（由低到高）")
     title: str
-    description: str
+    description: str = Field(description="问题描述：一句话说清是什么问题，含关键变量或函数")
+    root_cause: str = Field(
+        description="根因分析：详细指出具体问题代码位置(file:line)、数据流或调用链、所违反的契约或假设"
+    )
+    impact: str = Field(description="影响：可导致的后果及严重等级依据")
+    evidence: str = Field(description="代码证据：带行号的关键代码语句或片段")
+    suggestion: str = Field(description="修复方案：详细、可执行的具体改法与步骤")
     file: str
     line: int
     call_chain: list[str] = Field(description="从入口到问题点的调用链，file:line 形式；无法给出完整链路则必须为空列表")
@@ -145,11 +158,18 @@ class RawFindings(BaseModel):
     observations: list[Finding] = Field(default_factory=list)
 
 
+class ReviewCheck(BaseModel):
+    passed: bool = Field(description="检视结论是否通过格式与内容审查")
+    issues: list[str] = Field(default_factory=list, description="未通过时的具体问题")
+    feedback: str = Field(default="", description="给生成方的修正指引")
+
+
 class Verdict(BaseModel):
     id: str
     conclusion: str = Field(description="confirmed / refuted / uncertain")
-    severity: str = Field(description="复核后的严重等级")
+    severity: str = Field(description="复核后的严重等级：提示/一般/严重/致命 之一")
     confidence: float = Field(ge=0.0, le=1.0)
+    rebuttal_opinion: str = Field(description="反驳意见：一句话说明维持或推翻该 finding 的理由，三种结论均须给出")
     refutation_log: str = Field(description="反驳尝试记录：逐点核对结果")
     evidence_note: str = Field(default="", description="关键证据说明，file:line 形式")
     contract_dependent: bool = Field(default=False, description="是否属于依赖跨模块契约的条目(展示时降级)")

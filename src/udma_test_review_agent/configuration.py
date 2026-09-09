@@ -5,26 +5,30 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .model_config import resolve_model
+from .module_map import load_modules_map, parse_selection
+
 _AGENT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
 class ReviewConfig:
     project_root: str
-    mode: str = "all"
-    target_module: str = ""
+    modules: str = "all"
+    model_profile: str = ""
     excludes: tuple[str, ...] = (".git", "build", "temp")
-    small_module_token_threshold: int = 30000
+    small_module_line_threshold: int = 2000
+    max_review_attempts: int = 3
     first_token_timeout: float = 60.0
     chunk_timeout: float = 30.0
     output_root: str = field(default="")
     max_findings_per_pass: int = 40
 
     def __post_init__(self) -> None:
-        if self.mode not in ("single", "all"):
-            raise ValueError(f"非法 mode: {self.mode}")
-        if self.mode == "single" and not self.target_module:
-            raise ValueError("single 模式必须指定 target_module")
+        if self.model_profile:
+            resolve_model(self.model_profile)
+        modules_map = load_modules_map()
+        parse_selection(self.modules, [m.id for m in modules_map.modules])
         if not self.output_root:
             self.output_root = "output/review"
         output_path = Path(self.output_root)
