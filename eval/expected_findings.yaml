@@ -1,0 +1,225 @@
+# test_project 人工 ground truth（检视质量的度量基准）
+#
+# 匹配规则（见 scripts/eval_review.py）
+# --------------------------------
+# **主键是 (file, line)，容差 ±1，刻意不含 category。**
+# 依据：实测同一处缺陷的 category 在多次运行间于 memory / trust_boundary / ub 之间漂移，
+# 例如 parser.c:17 的 use-after-free 被标为 `ub`、buffer.c:7 的无界 strcpy 被标为
+# `trust_boundary`。按 category 匹配必然漏配，故 category/family 仅作同一锚点上多条
+# ground truth 的区分信号，不作匹配前提。
+#
+# 行号容差来自实测漂移：buffer.c 的未检查 malloc 在六次运行中报在 11 与 12。
+#
+# source 字段标注该缺陷「谁能证明」，用于区分工具可证与仅人能判：
+#   gcc-analyzer —— `gcc -fanalyzer -Wall -Wextra` 可独立命中（已实测）
+#   cppcheck     —— `cppcheck --enable=warning` 可独立命中（已实测）
+#   manual       —— 两个工具均抓不到，只能靠阅读判定
+# 这一标注是「工具缺席不等于证伪」这条规则的依据：最重要的 E01 恰恰两个工具都抓不到。
+
+project: test_project
+line_tolerance: 1
+# 锚点偏移窗口：确认条目本行坐标对不上、但在此窗口内有 ground truth 时，记为
+# 「锚点偏移的真阳性」而非假阳性。实测模型会把握不到「n == 0 写入越界」这类主张
+# 锚在函数签名行（buffer.c:10）而不是真正的写入语句（buffer.c:12），缺陷真实存在、
+# 只是定位不精确——把它记成假阳性会同时虚增误报、虚减召回。
+misanchor_window: 3
+
+# 高严重度内核 = 致命 + 严重，共 10 项，是 recall 的主要考核对象
+defects:
+  # ---------------- buffer.c / buffer.h ----------------
+  - id: E01
+    file: buffer.c
+    line: 7
+    family: memory
+    severity: 严重
+    title: copy_name 使用无界 strcpy，dst 容量无接口级保障
+    why: 签名 void copy_name(char *dst, const char *src) 不携带 dst 容量，写入长度完全由 src 决定；调用方传定长字段即溢出。
+    source: [manual]        # gcc-analyzer 与 cppcheck 均抓不到（需跨函数推断 dst 容量）
+
+  - id: E02
+    file: buffer.c
+    line: 12
+    family: memory
+    severity: 严重
+    title: make_buffer 未检查 malloc 返回值即写 p[0]，分配失败时解引用空指针
+    why: buffer.c:11 的 malloc(n) 结果未判空，buffer.c:12 直接 p[0] = '\0'。
+    source: [gcc-analyzer]
+
+  - id: E03
+    file: buffer.c
+    line: 12
+    family: ub
+    severity: 一般
+    title: make_buffer 在 n == 0 时仍写 p[0]，零大小分配上的写入越界
+    why: malloc(0) 返回非空时该块长度为 0，p[0] 写入即堆越界；返回 NULL 时则退化为 E02。与 E02 同为 buffer.c:12 上的不同主张。
+    source: [manual]
+
+  - id: E04
+    file: buffer.h
+    line: 7
+    family: resource
+    severity: 一般
+    title: make_buffer 返回堆指针但模块未提供释放接口与所有权说明
+    why: buffer.h 只声明 char *make_buffer(size_t)，无对应的 free 接口或所有权契约，调用方无法判断该不该释放。
+    source: [manual]
+
+  - id: E05
+    file: buffer.h
+    line: 6
+    family: logic
+    severity: 提示
+    title: copy_name 返回 void，调用方无法感知截断或失败
+    why: 模块内其他可失败操作返回 int（如 parse_records / load_file），copy_name 无返回值使溢出不可上报。
+    source: [manual]
+
+  # ---------------- parser.c / parser.h ----------------
+  - id: E06
+    file: parser.c
+    line: 17
+    family: memory
+    severity: 致命
+    title: parse_records 在 free 后读取 records[0].id，构成 use-after-free
+    why: parser.c:16 free(records) 之后，parser.c:17 仍解引用 records[0]。
+    source: [gcc-analyzer]
+
+  - id: E07
+    file: parser.c
+    line: 13
+    family: logic
+    severity: 严重
+    title: 循环内 memcpy 源地址恒为 data，未随 i 偏移
+    why: parser.c:13 每轮都从 data 起始处复制 8 字节，records[i].name 全部相同且只读了首 8 字节；源应为 data + i * 8 或等价偏移。
+    source: [manual]
+
+  - id: E08
+    file: parser.c
+    line: 13
+    family: trust_boundary
+    severity: 严重
+    title: 接口不携带 data 长度，按外部 count 驱动越界读
+    why: parse_records(const char *data, unsigned count) 无 data_len，循环按 count 读取，data 实际短于 count*8 时越界读。
+    source: [manual]
+
+  - id: E09
+    file: parser.c
+    line: 13
+    family: memory
+    severity: 严重
+    title: memcpy 固定复制 8 字节且不保证 NUL 终止，Record.name 交给下游易越界
+    why: parser.h:5 声明 char name[8]，parser.c:13 恰好写满 8 字节不留终止符；下游 copy_name 按 C 字符串处理即越界。
+    source: [manual]
+
+  - id: E10
+    file: parser.c
+    line: 17
+    family: memory
+    severity: 严重
+    title: count == 0 时 records[0] 读取零大小分配，越界读
+    why: count 为 0 时 malloc(0) 返回的块长度为 0，循环不执行，parser.c:17 仍读 records[0]。与 E06 同为 parser.c:17 上的不同主张。
+    source: [manual]
+
+  - id: E11
+    file: parser.c
+    line: 6
+    family: trust_boundary
+    severity: 一般
+    title: parse_records 未校验 data 是否为 NULL
+    why: 入参 data 直接进入循环解引用，无空指针检查。
+    source: [manual]
+
+  - id: E12
+    file: parser.c
+    line: 14
+    family: ub
+    severity: 提示
+    title: records[i].id 的 unsigned 到 int 窄化转换依赖 count 上界
+    why: (int)i 在 count 超过 INT_MAX 时为实现定义行为；实际不可达，仅作加固提示。
+    source: [manual]
+
+  # ---------------- resource.c / resource.h ----------------
+  - id: E13
+    file: resource.c
+    line: 7
+    family: memory
+    severity: 严重
+    title: fopen 失败未检查即传入 fread，fp 为 NULL 时未定义行为
+    why: resource.c:7 的 fopen 结果从未判空，resource.c:12 直接 fread(..., fp)。
+    source: [gcc-analyzer]
+
+  - id: E14
+    file: resource.c
+    line: 7
+    family: resource
+    severity: 严重
+    title: load_file 全程未 fclose，每次调用泄漏一个文件描述符
+    why: fp 在两条返回路径（resource.c:10 与 resource.c:15）上均未关闭。
+    source: [gcc-analyzer, cppcheck]
+
+  - id: E15
+    file: resource.c
+    line: 13
+    family: memory
+    severity: 一般
+    title: fread 返回值被忽略，短读时 buf[0] 读未初始化内存
+    why: resource.c:12 的 fread 返回值未核对，失败或短读后 resource.c:13 仍读 buf[0]。
+    source: [manual]
+
+  - id: E16
+    file: resource.c
+    line: 21
+    family: memory
+    severity: 致命
+    title: release_twice 对同一指针连续 free 两次，构成 double free
+    why: resource.c:20 与 resource.c:21 对 p 各 free 一次。
+    source: [gcc-analyzer, cppcheck]
+
+  - id: E17
+    file: resource.c
+    line: 19
+    family: memory
+    severity: 提示
+    title: release_twice 未检查 malloc(16) 返回值
+    why: 分配失败时 p 为 NULL；此处 free(NULL) 合法故不崩溃，但属错误处理缺失。
+    source: [manual]
+
+  - id: E18
+    file: resource.c
+    line: 7
+    family: trust_boundary
+    severity: 一般
+    title: load_file 未校验 path 是否为 NULL 即传入 fopen
+    why: 入参 path 无空指针检查，直接作为 fopen 实参。
+    source: [manual]
+
+# 明确**不是**缺陷的条目。用于度量「假阳性」：confirmed 命中这些坐标即为误报。
+# 每一项都给出了不判为缺陷的理由，避免这份清单本身变成手感判断。
+non_defects:
+  - id: X01
+    file: parser.c
+    line: 7
+    family: memory
+    reason: >-
+      count * sizeof(Record) 在 64 位平台上 unsigned 会整型提升为 64 位 size_t，不会溢出；
+      仅在 size_t 为 32 位时成立。scan.json 的 build_flags 只有 -I/-D、无 -m32，
+      流水线无从得知目标位宽，故在目标平台上不判为缺陷。基线中该条被 confirmed
+      且 confidence 仅 0.50 —— 正是「置信度算了却没人用」的典型代价。
+
+  - id: X02
+    file: parser.c
+    line: 8
+    family: resource
+    reason: >-
+      「records 未随结果转移所有权」不成立：parse_records 返回 int，没有需要转移的所有权，
+      free(records) 本身是正确的，真正的问题在 free 之后的 E06。
+
+  - id: X04
+    file: buffer.h
+    line: 1
+    family: macro
+    reason: 头文件保护宏 BUFFER_H 名称过于通用属命名风格问题，无实际语义后果。
+
+  - id: X05
+    file: resource.h
+    line: 1
+    family: macro
+    reason: 保护宏 RESOURCE_H 未含模块路径前缀，同属命名风格问题。
