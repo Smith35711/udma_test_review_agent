@@ -9,7 +9,7 @@ from ...log import get_logger
 from ...prompts.critical_paths import CRITICAL_PATH_PROMPT
 from ...schemas import CriticalPathReport, ScanResult
 from ...state import ReviewState
-from ..common import _config, _critical_paths_path, _module_order, _read_json, _write_json
+from ..common import _config, _critical_paths_path, _load_artifact, _module_order, _write_json
 
 from ._base import _llm
 
@@ -19,9 +19,10 @@ logger = get_logger(__name__)
 def critical_paths_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     persisted = _critical_paths_path(cfg)
-    if persisted.exists():
+    cached = _load_artifact(persisted, CriticalPathReport)
+    if cached is not None:
         logger.info("[S3] 命中断点，跳过关键路径分析: %s", persisted)
-        return {"critical_paths": _read_json(persisted)}
+        return {"critical_paths": cached.model_dump()}
 
     order = _module_order(cfg, ScanResult.model_validate(state["scan"]))
     archs = {k: v for k, v in (state.get("module_archs") or {}).items() if k in order}

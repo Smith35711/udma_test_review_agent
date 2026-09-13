@@ -20,7 +20,7 @@ from ..common import (
     _execute_batch,
     _findings_raw_path,
     _findings_verified_path,
-    _read_json,
+    _load_artifact,
     _stats,
     _write_json,
 )
@@ -180,7 +180,9 @@ def _resolve_claim_conflicts(ordered: list[dict[str, Any]]) -> list[dict[str, An
 def _review_check_one(cfg: ReviewConfig, state: ReviewState, module: str) -> dict[str, Any]:
     payload = dict(state["module_results"][module])
 
-    raw = RawFindings.model_validate(_read_json(_findings_raw_path(cfg, module)))
+    raw = _load_artifact(_findings_raw_path(cfg, module), RawFindings)
+    if raw is None:
+        raise FileNotFoundError(f"模块 {module} 缺少可用的检视产物: {_findings_raw_path(cfg, module)}")
     existing = {
         item["finding"]["id"]: item
         for item in payload.get("results", [])

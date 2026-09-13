@@ -16,8 +16,8 @@ from ..common import (
     _config,
     _execute_batch,
     _findings_verified_path,
+    _load_json,
     _module_arch_path,
-    _read_json,
     _stats,
 )
 from ._base import _llm
@@ -59,10 +59,12 @@ def _arch_brief(cfg: ReviewConfig, module: str) -> str:
     实测这正是 `M01 f6`、`M02 f4` 被推翻的直接原因。
     """
     path = _module_arch_path(cfg, module)
-    if not path.exists():
-        logger.warning("[反驳] %s 缺少架构产物，豁免判定将缺少契约依据: %s", module, path)
+    arch = _load_json(path)
+    if arch is None:
+        # 契约不可用不该让反驳整体失败：豁免判定缺少依据是既有的退化路径，
+        # 已在下游以「缺少契约依据」显式记账，比丢整个模块的反驳结论代价小得多。
+        logger.warning("[反驳] %s 缺少可用的架构产物，豁免判定将缺少契约依据: %s", module, path)
         return "(本模块架构不可用)"
-    arch = json.loads(path.read_text(encoding="utf-8"))
     contract = arch.get("concurrency_contract") or {}
     lines = [
         f"职责：{arch.get('responsibility', '')}",
@@ -114,9 +116,10 @@ def _rebuttal_one(
     cfg: ReviewConfig, scan: ScanResult, state: ReviewState, module: str
 ) -> dict[str, Any]:
     verified_path = _findings_verified_path(cfg, module)
-    if verified_path.exists():
+    cached = _load_json(verified_path)
+    if cached is not None:
         logger.info("[反驳] 命中断点: %s", module)
-        return {"module_results": {module: _read_json(verified_path)}}
+        return {"module_results": {module: cached}}
 
     raw = RawFindings.model_validate(state["module_raw"][module])
     findings = raw.findings

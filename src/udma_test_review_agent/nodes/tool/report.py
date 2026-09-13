@@ -11,12 +11,14 @@ from ...state import ReviewState
 from ..common import (
     _config,
     _findings_verified_path,
+    _load_json,
+    _load_text,
     _manifest_path,
     _module_dir,
     _module_size_path,
     _output_dir,
-    _read_json,
     _stats,
+    _write_text,
 )
 from ..llm.module_report import SUMMARY_FILE, render_module_report
 
@@ -40,10 +42,15 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         if module in failures:
             logger.warning("[报告] %s 评审失败，未计入统计: %s", module, failures[module])
             continue
+        payload = _load_json(_findings_verified_path(cfg, module))
+        if payload is None:
+            detail = f"report: 缺少可用产物 {_findings_verified_path(cfg, module)}"
+            failures[module] = detail
+            logger.error("[报告] %s", detail)
+            continue
         try:
-            payload = _read_json(_findings_verified_path(cfg, module))
             counts = _stats(payload["results"], len(payload.get("observations", [])))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (KeyError, TypeError) as exc:
             # 阶段未报错却无有效产物（被中断或写入截断），按失败处理而非中止整轮
             detail = f"report: {type(exc).__name__}: {exc}"
             failures[module] = detail
@@ -59,10 +66,8 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         # **按总报告自己的链接基准重新渲染**，而不是内联模块报告 Markdown：
         # 模块报告里的相对链接是按 <模块>/ 目录算的，原样内联到 <输出根>/report.md
         # 会让每一条链接都指错目录。摘要从副本取回，内容不丢。
-        size_path = _module_size_path(cfg, module)
-        size_info = _read_json(size_path) if size_path.exists() else None
-        summary_path = _module_dir(cfg, module) / SUMMARY_FILE
-        summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+        size_info = _load_json(_module_size_path(cfg, module))
+        summary = _load_text(_module_dir(cfg, module) / SUMMARY_FILE)
         module_md = render_module_report(
             module, payload, size_info, cfg.project_root, output_dir, summary=summary
         )
@@ -128,7 +133,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         overall += [""]
     report_text = "\n".join(overall)
     report_path = _output_dir(cfg) / "report.md"
-    report_path.write_text(report_text, encoding="utf-8")
+    _write_text(report_path, report_text)
 
     logger.info(
         "[报告] 完成 %s 耗时%.1fs confirmed=%d refuted=%d uncertain=%d",

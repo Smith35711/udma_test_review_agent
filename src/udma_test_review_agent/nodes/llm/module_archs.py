@@ -12,9 +12,10 @@ from ...tools.executors import c_scanner
 from ..common import (
     _config,
     _global_context_for_module,
+    _inventory,
+    _load_artifact,
     _module_arch_path,
     _module_order,
-    _read_json,
     _truncate,
     _write_json,
 )
@@ -66,11 +67,12 @@ def module_archs_node(state: ReviewState) -> dict[str, Any]:
     archs: dict[str, Any] = dict(state.get("module_archs") or {})
     for module in order:
         arch_path = _module_arch_path(cfg, module)
-        if arch_path.exists():
-            archs[module] = _read_json(arch_path)
+        cached = _load_artifact(arch_path, ModuleArchitecture)
+        if cached is not None:
+            archs[module] = cached.model_dump()
             logger.info("[S2] 命中断点: %s", module)
             continue
-        inventory = next(m for m in scan.modules if m.name == module)
+        inventory = _inventory(scan, module)
         module_files = {f.path for f in inventory.files}
         source = c_scanner.module_source_text(scan, module)
         prompt = MODULE_ARCH_PROMPT.format(

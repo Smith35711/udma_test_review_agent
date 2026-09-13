@@ -12,7 +12,7 @@ from ...prompts.global_arch import GLOBAL_ARCH_PROMPT
 from ...schemas import GlobalArchitecture, ScanResult
 from ...state import ReviewState
 from ...tools.executors import c_scanner
-from ..common import _config, _global_arch_path, _read_json, _write_json
+from ..common import _config, _global_arch_path, _load_artifact, _write_json
 
 from ._base import _llm
 
@@ -75,10 +75,10 @@ def _ground_entries(scan: ScanResult, arch: GlobalArchitecture) -> tuple[GlobalA
 def global_arch_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     persisted = _global_arch_path(cfg)
-    if persisted.exists():
-        arch = GlobalArchitecture.model_validate(_read_json(persisted))
+    cached = _load_artifact(persisted, GlobalArchitecture)
+    if cached is not None:
         logger.info("[S1] 命中断点，跳过全局架构分析: %s", persisted)
-        return {"global_arch": arch.model_dump()}
+        return {"global_arch": cached.model_dump()}
 
     scan = ScanResult.model_validate(state["scan"])
     root = Path(scan.project_root)

@@ -2,19 +2,41 @@
 
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
+from pydantic import BaseModel
+
+from ..artifact_io import read_json as _load_json
+from ..artifact_io import read_text as _load_text
+from ..artifact_io import write_json_atomic as _write_json
+from ..artifact_io import write_text_atomic as _write_text
 from ..configuration import ReviewConfig
 from ..log import get_logger
 from ..manifest import MANIFEST_FILE
 from ..module_map import id_sort_key, parse_selection
-from ..schemas import GlobalArchitecture, ScanResult, ToolEvidenceReport
+from ..schemas import GlobalArchitecture, ModuleInventory, ScanResult, ToolEvidenceReport
 from ..state import ReviewState
 
 logger = get_logger(__name__)
+
+_M = TypeVar("_M", bound=BaseModel)
+
+__all__ = [
+    "_config",
+    "_execute_batch",
+    "_inventory",
+    "_load_artifact",
+    "_load_json",
+    "_load_text",
+    "_output_dir",
+    "_write_json",
+    "_write_text",
+]
+"""对外暴露的名字。产物读写原语（`_load_json`/`_write_json`/…）只是 `artifact_io`
+在节点层的别名——实现已上移到包级的 `artifact_io`，因为 `manifest.py` 等非节点模块
+也需要原子写，放在这里会造成反向依赖。保留同名别名，使节点侧调用点不必关心分层。"""
 
 
 _CONFIG_CACHE: dict[tuple, ReviewConfig] = {}
@@ -137,12 +159,20 @@ def _output_dir(cfg: ReviewConfig, module: str = "") -> Path:
     return path
 
 
-def _write_json(path: Path, data: Any) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+def _load_artifact(path: Path, schema: type[_M]) -> _M | None:
+    """读取并经 schema 校验的产物；缺失、损坏或不合 schema 均返回 None。
 
-
-def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    这是「产物即接口」在读取侧的落点：调用方拿到 None 即表示「断点不成立，重算」，
+    不必自己判断文件是否存在、是否可解析、是否过期格式。
+    """
+    data = _load_json(path)
+    if data is None:
+        return None
+    try:
+        return schema.model_validate(data)
+    except ValueError as exc:
+        logger.warning("[产物] 不符合 schema，按缺失处理（将重算该阶段）: %s (%s)", path, exc)
+        return None
 
 
 def _truncate(text: str, limit: int = 12000) -> str:
@@ -164,14 +194,7 @@ def _load_tool_evidence(cfg: ReviewConfig) -> ToolEvidenceReport:
     放在 common 而非工具节点里，是为了让检视与核对两侧都从同一处取用，
     避免节点之间互相 import。
     """
-    path = _tool_evidence_path(cfg)
-    if not path.exists():
-        return ToolEvidenceReport()
-    try:
-        return ToolEvidenceReport.model_validate(_read_json(path))
-    except (OSError, ValueError) as exc:
-        logger.warning("[工具证据] 产物不可用，按无证据处理: %s (%s)", path, exc)
-        return ToolEvidenceReport()
+    return _load_artifact(_tool_evidence_path(cfg), ToolEvidenceReport) or ToolEvidenceReport()
 
 
 def _global_arch_path(cfg: ReviewConfig) -> Path:
@@ -204,6 +227,20 @@ def _findings_raw_path(cfg: ReviewConfig, module: str) -> Path:
 
 def _findings_verified_path(cfg: ReviewConfig, module: str) -> Path:
     return _module_dir(cfg, module) / "findings_verified.json"
+
+
+def _inventory(scan: ScanResult, module: str) -> ModuleInventory:
+    """按模块标识取扫描清单，缺失时给出可诊断的错误。
+
+    全流程以 `module_id` 做 key（`_module_order` 也用 `module_id`），但原先多处写成
+    `next(m for m in scan.modules if m.name == module)`——匹配的是**另一个字段**，
+    且缺失时抛裸 `StopIteration`，看不出是标识写错还是扫描产物过期。此处同时接受
+    `name` 仅为兼容旧产物，主键仍是 `module_id`。
+    """
+    for inventory in scan.modules:
+        if inventory.module_id == module or inventory.name == module:
+            return inventory
+    raise KeyError(f"扫描产物中没有模块 {module}；可用模块: {[m.module_id for m in scan.modules]}")
 
 
 def _module_order(cfg: ReviewConfig, scan: ScanResult) -> list[str]:

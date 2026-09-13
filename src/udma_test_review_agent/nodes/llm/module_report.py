@@ -17,11 +17,11 @@ from typing import Any
 
 from ... import findings_util as fu
 from ...configuration import ReviewConfig
-from ...llm import stream_llm_once
 from ...log import get_logger
 from ...prompts.report import REPORT_SUMMARY_PROMPT
 from ...state import ReviewState
-from ..common import _config, _execute_batch, _module_dir, _truncate
+from ..common import _config, _execute_batch, _module_dir, _truncate, _write_text
+from ._base import _llm
 
 logger = get_logger(__name__)
 
@@ -248,20 +248,17 @@ def _module_report_one(cfg: ReviewConfig, state: ReviewState, module: str) -> di
     body = render_module_report(module, payload, size_info, cfg.project_root, report_path.parent)
     summary = ""
     try:
-        summary = stream_llm_once(
-            REPORT_SUMMARY_PROMPT.format(report=_truncate(body, 8000)),
-            profile=cfg.model_profile or None,
-            first_token_timeout=cfg.first_token_timeout,
-            chunk_timeout=cfg.chunk_timeout,
-        )
+        # 走 `_llm` 而非直接调 `stream_llm_once`：摘要同样需要重试与超时封装，
+        # 且 `_llm` 是「LLM 唯一出口」这一定位在节点侧的落点（schema=None 即纯文本）。
+        summary = _llm(REPORT_SUMMARY_PROMPT.format(report=_truncate(body, 8000)), None, cfg)
         logger.debug("[模块报告] %s 摘要字符=%d", module, len(summary))
     except Exception as exc:  # noqa: BLE001 - 摘要失败不阻塞报告落盘
         logger.warning("[模块报告] %s 摘要生成失败: %s", module, exc)
     module_md = render_module_report(module, payload, size_info, cfg.project_root, report_path.parent, summary=summary)
-    report_path.write_text(module_md, encoding="utf-8")
+    _write_text(report_path, module_md)
     # 摘要另存一份：总报告需要用**自己的**链接基准重新渲染各模块卡片（见 report.py），
     # 若只把模块 Markdown 内联过去，其中的相对链接会全部指错目录。
-    (_module_dir(cfg, module) / SUMMARY_FILE).write_text(summary, encoding="utf-8")
+    _write_text(_module_dir(cfg, module) / SUMMARY_FILE, summary)
     logger.info("[模块报告] %s 完成 耗时%.1fs 产物=%s", module, time.monotonic() - started, report_path)
     return {}
 

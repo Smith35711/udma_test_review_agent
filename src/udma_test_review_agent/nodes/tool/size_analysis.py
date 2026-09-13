@@ -8,19 +8,21 @@ from ...configuration import ReviewConfig
 from ...log import get_logger
 from ...schemas import ModuleSize, ScanResult
 from ...state import ReviewState
-from ..common import _config, _execute_batch, _module_size_path, _read_json, _write_json
+from ..common import _config, _execute_batch, _inventory, _load_artifact, _module_size_path, _write_json
 
 logger = get_logger(__name__)
 
 
 def _size_analysis_one(cfg: ReviewConfig, scan: ScanResult, module: str) -> dict[str, Any]:
     persisted = _module_size_path(cfg, module)
-    if persisted.exists():
-        data = _read_json(persisted)
+    # 断点复用前先经 schema 校验：损坏产物按「不存在」处理并重算，而不是让它
+    # 带着无法解析的内容进入下游。
+    cached = _load_artifact(persisted, ModuleSize)
+    if cached is not None:
         logger.info("[尺寸] 命中断点: %s", module)
-        return {"module_size": {module: data}}
+        return {"module_size": {module: cached.model_dump()}}
 
-    inventory = next(m for m in scan.modules if m.name == module)
+    inventory = _inventory(scan, module)
     lines = sum(file_info.lines for file_info in inventory.files)
     chars = inventory.chars
     size_class = "small" if lines <= cfg.small_module_line_threshold else "large"

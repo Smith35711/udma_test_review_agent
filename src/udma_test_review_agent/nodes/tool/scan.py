@@ -13,10 +13,10 @@ from ...state import ReviewState
 from ...tools.executors import c_scanner
 from ..common import (
     _config,
+    _load_artifact,
     _manifest_path,
     _module_order,
     _output_dir,
-    _read_json,
     _scan_persist_path,
     _write_json,
 )
@@ -57,9 +57,8 @@ def scan_node(state: ReviewState) -> dict[str, Any]:
         logger.debug("[S0] 输入指纹一致 digest=%s 源码文件=%d", current.digest, len(current.sources))
     manifest.save_manifest(manifest_path, current)
 
-    scan: ScanResult | None = None
-    if persisted.exists():
-        scan = ScanResult.model_validate(_read_json(persisted))
+    scan: ScanResult | None = _load_artifact(persisted, ScanResult)
+    if scan is not None:
         if not all(m.module_id for m in scan.modules):
             logger.warning("[S0] 扫描产物缺少 module_id（旧格式），重新扫描: %s", persisted)
             scan = None
@@ -90,8 +89,11 @@ def scan_node(state: ReviewState) -> dict[str, Any]:
     return {
         "scan": scan.model_dump(),
         "module_order": _module_order(cfg, scan),
+        # 以下字段在本次图执行内由后续节点累积，此处显式清空以完整定义「一轮运行从
+        # 空状态开始」这一契约；漏掉 module_raw 会让带残留状态重入时静默复用旧检视结果。
         "module_size": {},
-        "review_index": 0,
+        "module_raw": {},
         "module_results": {},
+        "review_index": 0,
         "module_failures": {},
     }

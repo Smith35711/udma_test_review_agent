@@ -33,9 +33,11 @@ from ..common import (
     _execute_batch,
     _findings_raw_path,
     _global_context_for_module,
+    _inventory,
+    _load_artifact,
+    _load_json,
     _module_arch_path,
     _module_size_path,
-    _read_json,
     _truncate,
     _write_json,
 )
@@ -83,7 +85,7 @@ def _module_flagged(scan: ScanResult, global_arch: GlobalArchitecture, module: s
     若让一条凭函数名猜出来的「并发热点」触发它，代价是白花钱 + 产出一整类假阳性。
     模块归属与检视上下文共用 `_belongs_to_module`，避免两处规则不一致导致的静默错配。
     """
-    inventory = next(m for m in scan.modules if m.name == module)
+    inventory = _inventory(scan, module)
     files = {f.path for f in inventory.files}
     entries = [e for e in global_arch.trust_entries if _belongs_to_module(e.file, files)]
     spots = [s for s in global_arch.concurrency_hotspots if _belongs_to_module(s.file, files)]
@@ -289,8 +291,7 @@ def _critical_paths(state: ReviewState, cfg: ReviewConfig) -> list[dict[str, Any
     """
     data = state.get("critical_paths")
     if not data:
-        path = _critical_paths_path(cfg)
-        data = _read_json(path) if path.exists() else {}
+        data = _load_json(_critical_paths_path(cfg)) or {}
     return list((data or {}).get("paths") or [])
 
 
@@ -302,8 +303,12 @@ def _review_module_raw(
     cfg: ReviewConfig,
     state_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    arch = ModuleArchitecture.model_validate(_read_json(_module_arch_path(cfg, module)))
-    inventory = next(m for m in scan.modules if m.name == module)
+    arch = _load_artifact(_module_arch_path(cfg, module), ModuleArchitecture)
+    if arch is None:
+        # 架构产物是检视的硬输入：缺失或损坏时给出可诊断的错误，交由失败隔离
+        # 跳过该模块，而不是让裸的 JSONDecodeError 冒到批次层。
+        raise FileNotFoundError(f"模块 {module} 缺少可用的架构产物: {_module_arch_path(cfg, module)}")
+    inventory = _inventory(scan, module)
     module_files = {f.path for f in inventory.files}
     global_context = _global_context_for_module(global_arch, module, module_files)
     critical = _critical_paths_for_module(state_paths, module_files)
@@ -441,9 +446,10 @@ def _review_one(
     size_class: str,
     state_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if _findings_raw_path(cfg, module).exists():
+    cached = _load_artifact(_findings_raw_path(cfg, module), RawFindings)
+    if cached is not None:
         logger.info("[检视] 命中断点: %s", module)
-        return {"module_raw": {module: _read_json(_findings_raw_path(cfg, module))}}
+        return {"module_raw": {module: cached.model_dump()}}
 
     started = time.monotonic()
     data = _review_module_raw(scan, global_arch, module, size_class, cfg, state_paths)
@@ -462,7 +468,7 @@ def _size_class(cfg: ReviewConfig, sizes: dict[str, Any], module: str) -> str:
     value = (sizes.get(module) or {}).get("size_class")
     if value:
         return str(value)
-    artifact = _read_json(_module_size_path(cfg, module)) if _module_size_path(cfg, module).exists() else {}
+    artifact = _load_json(_module_size_path(cfg, module)) or {}
     value = artifact.get("size_class")
     if value:
         logger.warning("[检视] %s 规模分类不在 state 中，已从 size.json 回退读取: %s", module, value)
