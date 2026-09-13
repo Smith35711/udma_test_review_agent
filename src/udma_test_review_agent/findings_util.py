@@ -66,7 +66,11 @@ def norm_severity(value: Any) -> str:
 
 
 def severity_rank(value: Any) -> int:
-    """严重等级排序键，越小越严重；未知等级返回 9（排在所有已知等级之后）。"""
+    """严重等级排序键，越小越严重。
+
+    取值为「无法识别」时落到「一般」（rank 2）——`norm_severity` 已经把未知等级收敛到
+    四档之内，故 `SEVERITY_ORDER.get` 的兜底值 9 实际不可达，仅作防御。
+    """
     return SEVERITY_ORDER.get(norm_severity(value), 9)
 
 
@@ -326,7 +330,14 @@ def resolve_conclusions(conclusions: Iterable[str]) -> tuple[str, bool]:
         return known[0], False
     if {"confirmed", "refuted"} <= unique:
         return "uncertain", True
-    return min(unique, key=lambda c: _CONCLUSION_RANK[c]), False
+    # 逐对显式判定，不用「按 rank 取最小」代劳：rank 的次序是为了排序（confirmed 在前），
+    # 拿它当"哪条结论更强"用，在 refuted 与 uncertain 上会得出与契约相反的答案
+    # （refuted 按提示词契约须给出具体反证，强于「未能判定」，应胜出）。
+    if unique == {"confirmed", "uncertain"}:
+        return "confirmed", False
+    if unique == {"refuted", "uncertain"}:
+        return "refuted", False
+    return "uncertain", False
 
 
 def _norm_token(value: Any) -> str:

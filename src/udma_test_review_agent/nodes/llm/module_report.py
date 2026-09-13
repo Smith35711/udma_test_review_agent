@@ -101,7 +101,12 @@ def _finding_card(
 ) -> list[str]:
     """一张卡片 = 一个锚点。组内多条主张按各自结论分行列出。"""
     head = group[0]
-    location = _location_link(project_root, link_base, head.get("file", ""), int(head.get("line") or 0))
+    # `group` 的元素是 `{finding, verdict}` 包装层，file/line 在 `finding` 里。
+    # 直接读包装层会静默拿到空串，卡片位置退化成 `` `:0` ``——链接看着在、指向却是空的。
+    head_finding = head.get("finding") or {}
+    location = _location_link(
+        project_root, link_base, head_finding.get("file", ""), int(head_finding.get("line") or 0)
+    )
     severity = fu.worst_severity(
         (item.get("verdict") or {}).get("severity") or item.get("severity") for item in group
     )

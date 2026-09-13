@@ -81,7 +81,12 @@ def _print_models(profile: str | None) -> int:
     return 1 if unknown else 0
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """构造 CLI 参数表。
+
+    抽成独立函数是为了让测试能直接断言参数契约（例如 `--fail-on` 的 choices 与
+    `FAIL_ON_RANK` 同源）——写在 `main()` 里就只能靠子进程调用来测。
+    """
     parser = argparse.ArgumentParser(description="udma 测试评审智能体")
     parser.add_argument(
         "--project",
@@ -129,6 +134,11 @@ def main() -> None:
         default=None,
         help="控制台日志等级（默认取环境变量 LOG_LEVEL，未设置则 INFO；日志文件始终记录 DEBUG）",
     )
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     set_log_level(args.log_level or os.getenv("LOG_LEVEL", "INFO"))

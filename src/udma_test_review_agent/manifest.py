@@ -153,7 +153,7 @@ def describe_changes(old: RunManifest | None, new: RunManifest) -> list[str]:
         before, after = getattr(old, name), getattr(new, name)
         if before == after:
             continue
-        if name == "sources" or name == "sources_digest":
+        if name == "sources_digest":
             changed.append(f"源码内容变化（{_source_change_brief(old, new)}）")
         elif name == "model_digest":
             changed.append("生效模型、采样参数或角色路由变化")
