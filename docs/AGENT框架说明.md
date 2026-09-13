@@ -4,6 +4,19 @@
 
 LangGraph 将 agent 建模为**有状态图**（StateGraph）：节点执行计算，边（含条件边）决定流转方向，共享状态（State）在各节点间传递，Checkpointer 提供持久化与会话记忆。本文以 langchain-ai/langgraph-template 及社区通行的 src 布局为基线，描述通用典型模板；实际工程可按需裁剪或引入 create_react_agent 等高层构造。
 
+> **本文描述的是通用模板，不是本工程的现状。** 下文凡与 `udma_test_review_agent` 不符之处，
+> 一律以 `README.md` 与代码为准。本工程相对模板的偏离见下节。
+
+## 本工程（udma_test_review_agent）相对模板的偏离
+
+| 模板中的形态 | 本工程的做法 | 原因 |
+| --- | --- | --- |
+| `tools/registry.py` 的 `@tool` 接口层 | **未使用**。`tools/registry.py`、`tools/__init__.py`、`tools/executors/script_runner.py` 是模板留下的空占位文件 | 本图的「工具节点」是 `nodes/tool/` 下的确定性图节点，不经模型绑定调用，registry 层没有消费者 |
+| `langgraph.json`、`.env.example` | **已删除** | 曾服务于 LangGraph Platform 部署与前端；该形态已移除，且 Python 侧从不加载 `.env`（唯一加载它的是 `langgraph.json` 的 `env` 字段） |
+| Checkpointer / 会话记忆 / `interrupt` 人工中断 | **不使用**。`builder.compile()` 无 checkpointer | 评审是单轮批处理，不需要跨会话记忆；断点续跑由**产物存在性 + 运行清单输入指纹**实现（见 README「产物与版本管理」），与 checkpointer 是两套机制 |
+| `state.py` 各字段显式声明 Reducer | **无 reducer 的 TypedDict，字段语义为「后写覆盖」** | 见下条「约定」中的说明；跨模块累积由节点显式读改写整个 dict，汇总统一从磁盘产物读取 |
+| `llm.py` 提供 `create_llm()` 唯一模型实例出口 | **唯一出口是 `stream_llm_once`**（流式、超时、心跳、采样参数、schema 校验）。`create_llm` / `generate_text` 是遗留的 langchain 路径，仅 `scripts/test_single_llm_node.py` 在用 | 生产节点需要流式超时与结构化输出校验，langchain 路径提供不了；**新增节点不得走那条路** |
+
 ## 目录布局
 
 ```
@@ -79,3 +92,6 @@ LangGraph 将 agent 建模为**有状态图**（StateGraph）：节点执行计�
 - 日志经 `log.py` 统一配置，节点与工具以模块级 `logger` 记录，禁止 `print` 输出。
 - 工具分层：模型仅经 `tools/registry.py` 暴露接口，复杂逻辑置于 `tools/executors/`，接口与实现不得混同。
 - 输出产物写入 `output/`，运行时中间文件置于 `temp/`；`temp/` 不入版本控制，会话结束须清理。
+
+> 其中「状态字段显式声明 Reducer」与「模型仅经 `tools/registry.py` 暴露接口」两条，
+> **本工程未采用**，理由见开头的偏离表。
