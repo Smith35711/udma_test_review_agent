@@ -237,7 +237,23 @@ class ReviewFunnel(BaseModel):
     model_observations: int = Field(default=0, description="各批次 observation 条数之和")
     location_invalid: int = Field(default=0, description="位置校验未通过、降级为 observation")
     tool_added: int = Field(default=0, description="工具补漏新增的候选")
+    tool_redundant: int = Field(
+        default=0,
+        description=(
+            "工具候选因与既有主张重复而弃用。判定口径是（文件, 所在函数, 缺陷种类）："
+            "同一处缺陷会被模型与工具报在不同行上（`load_file` 的 fd 泄漏，模型报在 fopen、"
+            "工具的两条 return 各报一次），按行号判重会让一次泄漏在报告里出三张卡"
+        ),
+    )
     tool_rejected: int = Field(default=0, description="工具候选因位置校验未通过被丢弃")
+    checklist_repair: int = Field(
+        default=0,
+        description=(
+            "触发补检的已定位检查项条数（上游架构给了 file:line、而首轮检视无同关切族结论）。"
+            "为 0 既可能是「首轮已全部回应」，也可能是「架构没给定位」——它是评价架构→检视"
+            "交接是否闭合的指标，不直接等于问题数"
+        ),
+    )
     after_dedup: int = Field(default=0, description="锚点+缺陷种类去重后的条数")
     capped: int = Field(default=0, description="超出单次上限被丢弃")
     obs_redundant: int = Field(default=0, description="与已保留主张重复或自身重复而剔除的 observation")

@@ -13,7 +13,7 @@ from ..artifact_io import read_text as _load_text
 from ..artifact_io import write_json_atomic as _write_json
 from ..artifact_io import write_text_atomic as _write_text
 from ..configuration import ReviewConfig
-from ..log import get_logger
+from ..log import current_stage, get_logger
 from ..manifest import MANIFEST_FILE
 from ..module_map import id_sort_key, parse_selection
 from ..schemas import GlobalArchitecture, ModuleInventory, ScanResult, ToolEvidenceReport
@@ -113,12 +113,18 @@ def _execute_batch(
     """
     existing = dict(state.get("module_failures") or {})
     pending = [module for module in _batch(state) if module not in existing]
+    # `ThreadPoolExecutor.submit` 不复制上下文变量，工作线程默认拿不到当前节点名。
+    # 在调用线程捕获后显式带入，使并发模块循环的日志同样带 `[节点]`。
+    stage = current_stage.get()
 
     def _run(module: str) -> tuple[str, dict[str, Any], Exception | None]:
+        token = current_stage.set(stage)
         try:
             return module, run_one(module), None
         except Exception as exc:  # noqa: BLE001 - 单模块失败不终止整轮
             return module, {}, exc
+        finally:
+            current_stage.reset(token)
 
     workers = min(_max_parallel(state), len(pending))
     logger.debug(

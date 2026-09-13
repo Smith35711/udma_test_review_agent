@@ -132,7 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str.upper,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default=None,
-        help="控制台日志等级（默认取环境变量 LOG_LEVEL，未设置则 INFO；日志文件始终记录 DEBUG）",
+        help="控制台与文件日志等级（默认取环境变量 LOG_LEVEL，未设置则 INFO）",
     )
     return parser
 

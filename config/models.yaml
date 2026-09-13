@@ -67,9 +67,12 @@ providers:
     api_key: ${OPENCODE_API_KEY}
 
 models:
+  # 默认启用 opencode-go 端点（https://opencode.ai/zen/go/v1）。密钥未显式配在
+  # providers.opencode 时，运行期按 base_url 回退到 ~/.config/opencode/opencode.json
+  # 中同名端点的 apiKey；--list-models 的 KEY 列走同一条链。
   - name: deepseek-v4.1-flash
-    provider: deepseek
-    model: deepseek-v4.1-flash-expires-on-0910
+    provider: opencode
+    model: deepseek-v4.1-flash
 
   - name: deepseek-chat
     provider: deepseek

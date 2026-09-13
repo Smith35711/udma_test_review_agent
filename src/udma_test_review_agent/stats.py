@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
 
-from .log import get_logger
+from .log import current_stage, get_logger
 
 logger = get_logger(__name__)
 
@@ -195,9 +195,13 @@ def timed_stage(name: str, fn: Callable[..., _T]) -> Callable[..., _T]:
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> _T:
         started = time.monotonic()
+        # 节点执行边界写入当前节点名：这样节点内（含并发的模块循环线程，其上下文在
+        # 提交任务时被复制）发出的每条日志都带上 `[节点]`，无需各节点自行声明。
+        token = current_stage.set(name)
         try:
             return fn(*args, **kwargs)
         finally:
+            current_stage.reset(token)
             STATS.record_stage(name, time.monotonic() - started)
 
     return wrapper

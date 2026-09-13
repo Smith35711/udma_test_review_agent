@@ -29,6 +29,7 @@ from udma_test_review_agent.prompts import (
     review_check,
     review_domain,
     review_focused,
+    review_repair,
 )
 
 SHARED_NAMES = (
@@ -63,6 +64,7 @@ PROMPT_MODULES = (
     review,
     review_domain,
     review_focused,
+    review_repair,
     global_arch,
     module_arch,
     critical_paths,
@@ -70,7 +72,7 @@ PROMPT_MODULES = (
     review_check,
     report,
 )
-"""全部 9 个提示词模块路径。P6 整合后它们必须仍可导入（导入面未变）。"""
+"""全部提示词模块路径。新增提示词模块必须在此登记，否则占位符/调用点校验会静默漏掉它。"""
 
 
 class SharedFragmentTest(unittest.TestCase):
@@ -276,6 +278,49 @@ class PromptRenderingTest(unittest.TestCase):
         )
         self.assertIn(_unescape(_shared._JSON_CONTRACT), text)
         self.assertIn("MA", text)
+
+
+class RebuttalGuardrailTest(unittest.TestCase):
+    """反驳提示词里两条「不得推翻」的红线。
+
+    它们不是措辞偏好，而是实测出来的漏报来源：`buffer.c:7` 的无界 `strcpy` 被驳回，
+    理由正是「契约已把 dst 容量写成调用方前置条件」——而该接口根本无处表达这个前置
+    条件，这恰恰是 finding 的核心断言。提示词一旦被人「顺手精简」掉这两节，漏报会
+    静默回来，且没有任何别的地方会报警。
+    """
+
+    def test_precondition_cannot_serve_as_counter_evidence(self):
+        self.assertIn("6.1", rebuttal.REBUTTAL_BATCH_PROMPT)
+        self.assertIn("不得判 refuted", rebuttal.REBUTTAL_BATCH_PROMPT)
+        self.assertIn("契约已声明由调用方负责", rebuttal.REBUTTAL_BATCH_PROMPT)
+
+    def test_missing_callsite_is_evidence_gap_not_refutation(self):
+        self.assertIn("6.2", rebuttal.REBUTTAL_BATCH_PROMPT)
+        self.assertIn("找不到调用方 ≠ 已推翻", rebuttal.REBUTTAL_BATCH_PROMPT)
+
+    def test_exemption_is_scoped_to_concurrency(self):
+        """豁免的第一条只针对加锁，不得被扩用到长度/容量/所有权等其它义务。"""
+        self.assertIn("本项只豁免并发类断言", rebuttal.REBUTTAL_BATCH_PROMPT)
+
+
+class ChannelBoundaryTest(unittest.TestCase):
+    """检视提示词里「链路不完整只能降级并发/信任面」这条边界，三份路径必须一致。
+
+    实测 `buffer.c:7` 的无界 `strcpy` 因「看不到调用方」被放进 observations 而整类
+    移出结论表——observation 不进反驳、不计入统计。第八节虽已收窄，但第三节「检视
+    方法」与第十节「字段级要求」旧文本仍在说「链路不完整即降级」，模型按就近的旧
+    措辞行事。此处钉住三处口径一致，任一处被改回广谱降级即失败。
+    """
+
+    def test_method_says_incomplete_chain_is_not_a_demotion_reason(self):
+        self.assertIn("链路不完整本身不是降级理由", _shared._METHOD)
+        self.assertIn("未知调用方不等于证据不足", _shared._METHOD)
+
+    def test_field_rules_scope_demotion_to_concurrency_and_trust(self):
+        self.assertIn("不得因链路不完整而把 memory", _shared._FIELD_RULES)
+
+    def test_evidence_clause_still_carries_the_narrow_rule(self):
+        self.assertIn("其余类别（memory / ub / resource / logic / macro）不因链路不全而降级", _shared._EVIDENCE)
 
 
 if __name__ == "__main__":

@@ -266,6 +266,30 @@ def header_signatures_text(scan: ScanResult, module_name: str) -> str:
     return "\n\n".join(chunks) if chunks else "(本模块无本地头文件)"
 
 
+DECL_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+"""行内的标识符加左括号形态，用于在一行里认出被声明/调用的函数名。"""
+
+
+def containing_function_name(scan: ScanResult, rel_path: str, line: int) -> str:
+    """返回包含该行的函数名；未命中返回空串。
+
+    纯内存查表（`scan.functions` 已带全部函数的行区间），**不读盘**——调用方常在
+    逐条 finding 的循环里用它，而 `containing_function_code` 每次命中都要读一遍源码。
+    """
+    for func in scan.functions:
+        if func.file == rel_path and func.start_line <= line <= func.end_line:
+            return func.name
+    return ""
+
+
+def line_text_at(
+    scan: ScanResult, rel_path: str, line: int, *, cache: dict[str, list[str]] | None = None
+) -> str:
+    """取该行源码原文；文件不可读或行号越界返回空串。"""
+    lines = _file_lines(scan, rel_path, cache)
+    return lines[line - 1] if 0 < line <= len(lines) else ""
+
+
 def containing_function_code(scan: ScanResult, rel_path: str, line: int) -> tuple[str, str]:
     """返回 (函数名, 带行号函数源码)；未命中返回空串。"""
     for func in scan.functions:

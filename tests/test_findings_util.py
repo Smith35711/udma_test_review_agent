@@ -111,6 +111,44 @@ class DedupTest(unittest.TestCase):
         ]
         self.assertEqual(len(fu.dedup_claims(items)), 3)
 
+    def test_sentinel_kind_merges_into_same_family_explicit_kind(self):
+        """一侧只给族哨兵、另一侧给了同族具体种类，是同一主张，必须合并。
+
+        实测（补检引入后）：首轮漏填 defect_kind 的 `buffer.c:7` 与补检填了
+        `unbounded_write` 的同一缺陷，因 `family:memory` ≠ `unbounded_write` 出了两张
+        已确认卡。哨兵的含义是「知道族、说不出类」，应并入同类主张而非自成一类。
+        """
+        left = finding(id="f1", file="a.c", line=3, category="memory", defect_kind="")
+        right = finding(id="f2", file="a.c", line=3, category="memory", defect_kind="unbounded_write")
+        merged = fu.dedup_claims([left, right])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["defect_kind"], "unbounded_write", "显式种类不得被哨兵覆盖")
+
+    def test_sentinel_kind_does_not_merge_across_families(self):
+        """两个哨兵跨族仍须分开（这正是哨兵使用族名而非 other 的理由）。"""
+        left = finding(id="f1", file="resource.c", line=12, category="memory", defect_kind="")
+        right = finding(id="f2", file="resource.c", line=12, category="logic", defect_kind="")
+        self.assertEqual(len(fu.dedup_claims([left, right])), 2)
+
+    def test_sentinel_defers_to_explicit_kind_across_family_drift(self):
+        """一侧没分类、另一侧有显式种类，即便族标得不一致也合并。
+
+        实测：同一处 `strcpy` 无界写，首轮条目 category=ub、未填 defect_kind（哨兵
+        `family:ub`），补检条目 category=memory、defect_kind=unbounded_write；family 不等
+        但显然是同一缺陷，此前在报告同一张卡下列出两段几乎相同的主张。
+        """
+        left = finding(id="f1", file="buffer.c", line=7, category="ub", defect_kind="")
+        right = finding(id="f2", file="buffer.c", line=7, category="memory", defect_kind="unbounded_write")
+        merged = fu.dedup_claims([left, right])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["defect_kind"], "unbounded_write")
+
+    def test_sentinel_does_not_swallow_a_different_same_family_kind(self):
+        """同族的两个**显式**不同种类仍是两条：哨兵只兜底缺字段，不合并具体主张。"""
+        left = finding(id="f1", file="a.c", line=3, category="memory", defect_kind="null_deref")
+        right = finding(id="f2", file="a.c", line=3, category="memory", defect_kind="unbounded_write")
+        self.assertEqual(len(fu.dedup_claims([left, right])), 2)
+
     def test_merge_keeps_worst_severity_and_is_pure(self):
         left = finding(id="f1", file="a.c", line=3, severity="提示", root_cause="短")
         right = finding(id="f2", file="a.c", line=3, severity="致命", root_cause="更长的根因描述")

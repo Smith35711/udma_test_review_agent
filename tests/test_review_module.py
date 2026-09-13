@@ -372,6 +372,83 @@ class ChecklistGapTest(_ReviewHarness):
         out = self.run_review(self.small_llm(raw_findings([])))
         self.assertEqual(out["checklist_gaps"], [])
 
+    def test_header_declaration_of_a_covered_function_closes_the_gap(self):
+        """检查项锚在头文件的**函数声明行**、结论落在该函数的实现里，算已回应。
+
+        实测 M01 的 3 条 buffer.h 检查项全是这种形态（上游锚在 `buffer.h:6` 的
+        `void copy_name(...)`，检视在 `buffer.c:7` 的函数体里出结论），按位置比对
+        一律误判成「无回应」，于是「优先人工复核」那一节整节都是假警报。
+        """
+        self.write_arch(checklist=[checklist_item(item="核对 copy 的边界", file="a.h", line=1)])
+        out = self.run_review(self.small_llm(raw_findings([finding(file="a.c", line=_STRCPY_LINE)])))
+        self.assertEqual(out["checklist_gaps"], [])
+
+    def test_header_item_naming_no_covered_function_still_gaps(self):
+        """声明行里没有本轮出过结论的函数名时照旧记账——销账只认声明行，不认正文提及。"""
+        self.write_arch(checklist=[checklist_item(item="核对 parse 的边界", file="a.h", line=2)])
+        out = self.run_review(self.small_llm(raw_findings([finding(file="a.c", line=_STRCPY_LINE)])))
+        self.assertEqual(len(out["checklist_gaps"]), 1)
+        self.assertIn("a.h:2", out["checklist_gaps"][0])
+
+
+class ChecklistRepairTest(_ReviewHarness):
+    """已定位检查项的**闭环补检**：首轮无同关切族结论时追加定向检视。
+
+    这不是收尾记账，而是流程动作：上游架构已经把线索定位到 file:line，若首轮开放式
+    检视没回应，就带着这些线索定向再问一次。判据按**关切族**而非仅位置——同一行上可以
+    并存多个都成立的缺陷，按位置销账会把它们一并抹掉。
+    """
+
+    def test_same_line_different_concern_triggers_a_repair_pass(self):
+        """同一行上首轮报了 logic，上游的 trust_boundary 检查项仍算未回应。"""
+        self.write_arch(
+            checklist=[
+                checklist_item(category="trust_boundary", item="校验外部长度", file="a.c", line=_STRCPY_LINE)
+            ]
+        )
+        out = self.run_review(
+            self.small_llm(
+                raw_findings(
+                    [finding(file="a.c", line=_STRCPY_LINE, category="logic", defect_kind="index_not_advanced")]
+                ),
+                raw_findings(
+                    [finding(file="a.c", line=_STRCPY_LINE, category="trust_boundary", defect_kind="path_trust")]
+                ),
+            )
+        )
+        self.assertEqual(out["funnel"]["checklist_repair"], 1)
+        self.assertIn("path_trust", {f["defect_kind"] for f in out["findings"]})
+
+    def test_same_concern_does_not_trigger_repair(self):
+        """首轮已在同位置给出同关切族的结论，就不必再花一次调用。"""
+        self.write_arch(
+            checklist=[checklist_item(category="memory", item="核对越界", file="a.c", line=_STRCPY_LINE)]
+        )
+        out = self.run_review(
+            self.small_llm(
+                raw_findings([finding(file="a.c", line=_STRCPY_LINE, category="memory", defect_kind="unbounded_write")])
+            )
+        )
+        self.assertEqual(out["funnel"]["checklist_repair"], 0)
+
+    def test_repair_pass_closes_the_gap_when_it_answers(self):
+        """补检给出同关切族结论后，最终记账不再把该项列为漏检。"""
+        self.write_arch(
+            checklist=[
+                checklist_item(category="trust_boundary", item="校验外部长度", file="a.c", line=_STRCPY_LINE)
+            ]
+        )
+        out = self.run_review(
+            self.small_llm(
+                raw_findings([]),
+                raw_findings(
+                    [finding(file="a.c", line=_STRCPY_LINE, category="trust_boundary", defect_kind="path_trust")]
+                ),
+            )
+        )
+        self.assertEqual(out["funnel"]["checklist_repair"], 1)
+        self.assertEqual(out["checklist_gaps"], [])
+
 
 class ToolInjectionTest(_ReviewHarness):
     def _tool_report(self, entries: list[dict]) -> None:
@@ -429,6 +506,67 @@ class ToolInjectionTest(_ReviewHarness):
         self._tool_report([{**self._entry(), "file": "b.c", "line": _MEMCPY_LINE}])
         out = self.run_review(self.small_llm(raw_findings([])), module="M01")
         self.assertEqual(out["funnel"]["tool_added"], 0)
+
+    _LEAK_SIG_LINE = 9
+    """`a.c` 里 `leak` 的函数签名行——在函数内，但距 `_LEAK_END_LINE` 两行以上，
+    故不会命中「同位置」那条判定，能把「同函数同种类」这条单独试出来。"""
+    _LEAK_END_LINE = 11
+    """`leak` 的收尾 `}`。"""
+
+    def test_same_claim_in_the_same_function_is_not_injected(self):
+        """同一函数内的同种缺陷算同一主张，不因报在不同行而补第二张卡。
+
+        实测 `resource.c` 的 fd 泄漏被报成三张已确认卡：模型报在 `fopen`（:7），
+        gcc 对两条 return 各报一条（:10、:15）。只看行号，这三条互不相识，
+        一次泄漏在报告里出现三次。
+        """
+        self.write_arch()
+        self._tool_report([self._entry(rule="-Wanalyzer-file-leak", line=self._LEAK_END_LINE)])
+        out = self.run_review(
+            self.small_llm(
+                raw_findings([finding(file="a.c", line=self._LEAK_SIG_LINE, defect_kind="missing_release")])
+            )
+        )
+        self.assertEqual(out["funnel"]["tool_added"], 0)
+        self.assertEqual(out["funnel"]["tool_redundant"], 1)
+        self.assertEqual(len(out["findings"]), 1)
+
+    def test_same_kind_in_another_function_is_still_injected(self):
+        """跨函数的同种缺陷不受影响：不同函数里的两处泄漏本来就是两件事。"""
+        self.write_arch()
+        self._tool_report([self._entry(rule="-Wanalyzer-file-leak", line=_STRCPY_LINE)])
+        out = self.run_review(
+            self.small_llm(
+                raw_findings([finding(file="a.c", line=self._LEAK_SIG_LINE, defect_kind="missing_release")])
+            )
+        )
+        self.assertEqual(out["funnel"]["tool_added"], 1)
+        self.assertEqual(out["funnel"]["tool_redundant"], 0)
+
+    def test_other_kind_on_the_same_line_is_still_a_reason_not_to_inject(self):
+        """同位置已有别的主张时也不补：工具报的是不是同一件事由 review_check 裁决。
+
+        实测 `resource.c:21` 上 gcc 同时报 double-free 与 use-after-free，而模型只报了
+        double free——按「同函数同种类」判定会放行后者，凭空多出一张卡。
+        """
+        self.write_arch()
+        self._tool_report([self._entry(rule="-Wanalyzer-file-leak", line=self._LEAK_END_LINE)])
+        out = self.run_review(
+            self.small_llm(
+                raw_findings([finding(file="a.c", line=self._LEAK_END_LINE, defect_kind="other")])
+            )
+        )
+        self.assertEqual(out["funnel"]["tool_added"], 0)
+        self.assertEqual(out["funnel"]["tool_redundant"], 1)
+
+    def test_invalid_tool_location_is_counted_as_rejected(self):
+        """位置校验未通过的候选进 `tool_rejected`——「补漏 0 条」必须能区分
+        「工具没报」「全被判重复」与「位置对不上」三种情形。"""
+        self.write_arch()
+        self._tool_report([self._entry(line=9999)])
+        out = self.run_review(self.small_llm(raw_findings([])))
+        self.assertEqual(out["funnel"]["tool_added"], 0)
+        self.assertEqual(out["funnel"]["tool_rejected"], 1)
 
 
 class FocusedPassTest(_ReviewHarness):

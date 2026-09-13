@@ -283,7 +283,6 @@ def match_for(
         return [], []
     if not file or line <= 0:
         return [], []
-    kind = fu.defect_kind(finding)
     same_kind: list[dict] = []
     same_place: list[dict] = []
     for entry in _as_dicts(entries):
@@ -296,7 +295,10 @@ def match_for(
         if distance > tolerance:
             continue
         mapping = map_rule(str(entry.get("rule") or ""))
-        if mapping is not None and mapping.defect_kind == kind:
+        # 同类判定与去重同源：模型只给族哨兵时，工具的同类具体种类仍算印证。
+        if mapping is not None and fu.kinds_overlap(
+            finding.get("defect_kind"), finding.get("category"), mapping.defect_kind, mapping.category
+        ):
             same_kind.append(entry)
         else:
             same_place.append(entry)

@@ -53,21 +53,56 @@ class ModelConfigError(ValueError):
     """模型配置缺失或非法。"""
 
 
-def load_deepseek_config(config_path: str | os.PathLike | None = None) -> dict[str, str]:
-    """读取 opencode 全局配置中的 deepseek provider 选项（apiKey/baseURL）。
-
-    该文件是密钥的兜底来源；读取失败一律返回空字典，由调用方决定是否报错。
-    """
+def _load_opencode_providers(config_path: str | os.PathLike | None = None) -> dict[str, Any]:
+    """读取 opencode 全局配置的 `provider` 表；读取失败一律返回空字典。"""
     path = Path(config_path or os.getenv("OPENCODE_CONFIG", _OPENCODE_CONFIG_DEFAULT))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    try:
-        options = data["provider"]["deepseek"]["options"]
-    except (KeyError, TypeError):
+    providers = data.get("provider") if isinstance(data, dict) else None
+    return providers if isinstance(providers, dict) else {}
+
+
+def _provider_options(block: object) -> dict[str, str]:
+    """取单个 provider 块的 `options` 中的 apiKey/baseURL。"""
+    options = block.get("options") if isinstance(block, dict) else None
+    if not isinstance(options, dict):
         return {}
     return {key: options[key] for key in ("apiKey", "baseURL") if options.get(key)}
+
+
+def load_deepseek_config(config_path: str | os.PathLike | None = None) -> dict[str, str]:
+    """读取 opencode 全局配置中的 deepseek provider 选项（apiKey/baseURL）。
+
+    保留为兼容入口；通用逻辑见 `load_provider_config`。
+    """
+    return _provider_options(_load_opencode_providers(config_path).get("deepseek"))
+
+
+def load_provider_config(
+    base_url: str = "",
+    provider: str = "",
+    config_path: str | os.PathLike | None = None,
+) -> dict[str, str]:
+    """按 provider 名或端点 URL 从 opencode 全局配置里匹配 provider 选项。
+
+    名称与 URL 两条路都要：`models.yaml` 里的 provider 名（如 `opencode`）未必等于
+    opencode.json 里的键（如 `opencode-go`），但两者的 `baseURL` 一定指向同一端点。
+    先按名精确匹配，再按 URL 归一化比对；都匹配不到则回退 deepseek 块（历史行为）。
+    """
+    providers = _load_opencode_providers(config_path)
+    if provider and provider in providers:
+        options = _provider_options(providers[provider])
+        if options.get("apiKey"):
+            return options
+    want = str(base_url or "").rstrip("/")
+    if want:
+        for block in providers.values():
+            options = _provider_options(block)
+            if options.get("apiKey") and str(options.get("baseURL") or "").rstrip("/") == want:
+                return options
+    return _provider_options(providers.get("deepseek"))
 
 
 def resolve_api_key(spec: ModelSpec) -> str:
@@ -78,11 +113,16 @@ def resolve_api_key(spec: ModelSpec) -> str:
     `LLM_API_KEY` / `~/.config/opencode/opencode.json`——于是配置文件里用
     `${DEEPSEEK_API_KEY}` 引用（展开后为空）的模型，列表显示「未配置」却能正常跑，
     用户会据此误判该换模型。密钥本体只在运行期读取，本函数不打印任何取值。
+
+    全局配置的匹配按 `spec` 的 provider 名与 `base_url` 进行，故 `opencode-go`
+    这类「配置里写 `${OPENCODE_API_KEY}`、密钥实际在 opencode.json 里」的端点也能取到。
     """
     if spec.api_key:
         return spec.api_key
-    config = load_deepseek_config()
-    return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or config.get("apiKey", "")
+    env_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY")
+    if env_key:
+        return env_key
+    return load_provider_config(base_url=spec.base_url, provider=spec.provider).get("apiKey", "")
 
 
 def _expand_env(value: str) -> str:

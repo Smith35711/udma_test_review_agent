@@ -37,9 +37,9 @@ def bootstrap() -> None:
 def _quiet_console_and_route_file_log() -> None:
     """测试期把控制台降到 WARNING，并把日志文件挪到临时目录。
 
-    `log.py::get_logger` 会把 DEBUG 全量写进 `agent/output/llm_test.log`——那是真实运行的
-    心跳日志（约 5s 一条），测试顺手往里灌几百行噪声会让它失去参考价值。等级则纯粹是
-    噪音问题：断言失败时才需要那几行上下文。
+    真实运行时日志写进 `agent/output/llm_test.log`（约 5s 一条心跳，便于排查）；测试顺手
+    往里灌几百行噪声会让它失去参考价值。等级则纯粹是噪音问题：控制台压掉，文件保留
+    DEBUG 以便断言失败时能看到上下文。
 
     两件事都要**对已存在的 logger 补做一遍**：`get_logger` 只在首次建 handler 时读
     `LOG_LEVEL` 与 `_LOG_FILE`，而测试文件的 import 顺序由调用方决定——被测模块常常
@@ -79,7 +79,7 @@ def _retarget_file_handlers(original: Path, log_file: Path) -> None:
             logger.removeHandler(handler)
             handler.close()
             replacement = logging.FileHandler(log_file, encoding="utf-8")
-            replacement.setLevel(logging.DEBUG)  # 文件恒为 DEBUG，与生产一致
+            replacement.setLevel(logging.DEBUG)  # 测试期保留全量上下文；生产文件跟随 LOG_LEVEL（默认 INFO）
             replacement.setFormatter(formatter)
             logger.addHandler(replacement)
             for other in logger.handlers:  # 同一个 logger 的控制台

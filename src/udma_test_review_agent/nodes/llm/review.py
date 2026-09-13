@@ -14,6 +14,7 @@ from ...prompts.review import REVIEW_PROMPT
 from ...prompts.review_check import REVIEW_CONTENT_CHECK_PROMPT
 from ...prompts.review_domain import DOMAIN_REVIEW_PROMPT
 from ...prompts.review_focused import FOCUSED_REVIEW_PROMPT
+from ...prompts.review_repair import CHECKLIST_REPAIR_PROMPT
 from ...schemas import (
     Finding,
     GlobalArchitecture,
@@ -208,23 +209,60 @@ def _enrich_and_split(
 def _tool_candidates(
     scan: ScanResult,
     module_files: set[str],
-    covered: set[tuple[str, int]],
+    covered: list[Finding],
     entries: list[dict],
     cache: dict[str, list[str]],
-) -> list[Finding]:
-    """补漏：工具独立报出、而模型在本模块**一个字都没提**的位置，转为候选 finding。
+) -> tuple[list[Finding], int, int]:
+    """补漏：工具独立报出、而模型在本模块**一个字都没提**的主张，转为候选 finding。
 
-    只在「该锚点上模型没有任何主张」时注入——模型已提到该语句时，工具的作用是印证或
-    裁决（在 `review_check`），再注入一条只会让同一条语句重复出卡。
+    只在「模型没提过」时注入——模型已提到时，工具的作用是印证或裁决（在
+    `review_check`），再注入一条只会重复出卡。两道判定，任一命中即弃用：
+
+    - **同位置**：模型在该语句上已有主张（哪怕缺陷种类不同）。工具报的是不是同一件事
+      由 `review_check` 裁决，此处不越权新增；
+    - **同一主张**（按 `fu.kinds_overlap` 判同类）：同一函数内同类缺陷模型已主张过。这一条是必需的
+      ——工具会为同一处缺陷的每条路径各报一次，而模型只报一次，位置判定拦不住。
+
+    返回 `(候选, 被这两道判定弃用的条数, 因位置校验未通过而丢弃的条数)`。两个计数都要
+    进漏斗：工具补漏为 0 既可能是「工具没报」，也可能是「全被拦下了」，含义完全不同。
+
+    同类判定用 `fu.kinds_overlap`，与 `dedup_claims` 同源：模型条目只带族哨兵时，工具
+    报出的同族具体种类仍应算「已提过」，否则同一次泄漏会因一侧缺 `defect_kind` 被补第二张卡。
     """
+    covered_dicts = [f.model_dump() for f in covered]
     candidates: list[Finding] = []
+    redundant = 0
+    rejected = 0
     for entry, mapping in static_analyzers.injectable(entries):
         file = entry.get("file", "")
         line = int(entry.get("line") or 0)
         if file not in module_files or line <= 0:
             continue
-        if any(anchor_file == file and abs(anchor_line - line) <= static_analyzers.MATCH_TOLERANCE
-               for anchor_file, anchor_line in covered):
+        same_function = c_scanner.containing_function_name(scan, file, line)
+        at_same_line = any(
+            str(f.get("file") or "") == file
+            and abs(int(f.get("line") or 0) - line) <= static_analyzers.MATCH_TOLERANCE
+            for f in covered_dicts
+        )
+        same_claim = any(
+            str(f.get("file") or "") == file
+            and c_scanner.containing_function_name(scan, str(f.get("file") or ""), int(f.get("line") or 0))
+            == same_function
+            and fu.kinds_overlap(
+                f.get("defect_kind"), f.get("category"), mapping.defect_kind, mapping.category
+            )
+            for f in covered_dicts
+        )
+        if at_same_line or same_claim:
+            redundant += 1
+            logger.debug(
+                "[检视] 工具候选与既有主张重复，弃用 %s:%s %s（函数=%s，%s）",
+                file,
+                line,
+                mapping.defect_kind,
+                same_function or "未定位",
+                "同位置" if at_same_line else "同函数同种类",
+            )
             continue
         finding = Finding(
             id="",
@@ -248,9 +286,12 @@ def _tool_candidates(
         enriched, location = _enrich(scan, finding, cache)
         if location["status"] == "invalid":
             logger.debug("[检视] 工具候选位置校验未通过，丢弃 %s:%s %s", file, line, location["reason"])
+            rejected += 1
             continue
         candidates.append(enriched)
-    return candidates
+        # 已注入的候选也纳入「模型已提过」集合，使同一处缺陷的多条工具路径只补一条。
+        covered_dicts.append(enriched.model_dump())
+    return candidates, redundant, rejected
 
 
 _CHECKLIST_LINE_TOLERANCE = 2
@@ -261,27 +302,103 @@ _CHECKLIST_LINE_TOLERANCE = 2
 """
 
 
-def _checklist_gaps(
-    arch: ModuleArchitecture, findings: list[Finding], observations: list[Finding]
-) -> list[str]:
-    """上游已定位到 file:line、而本轮既未出 finding 也未出 observation 的检查项。
+def _declares_covered_function(
+    scan: ScanResult, item: Any, covered_functions: set[str], cache: dict[str, list[str]]
+) -> bool:
+    """检查项锚在某个函数的**声明行**、而本轮结论落在该函数的实现里，视为已回应。
 
-    这是对**漏检**的确定性记账：检查项带着行号进来，说明架构阶段已经看见了那里的问题，
-    若检视阶段整条无回应，就是信息在链路上丢失。此处只统计与告警，不改写结论——
-    检查项不成立本来也是合格结果，需要人工区分的是「核对过、判定不成立」与「压根没看」。
+    头文件声明是这条记账最常见的假警报来源：上游把检查项锚在 `buffer.h:6` 的
+    `void copy_name(...)` 上，检视阶段则在 `buffer.c:7` 的函数体里给出了结论。
+    两者是同一个函数的两面，按位置比对必然判成「无回应」——实测一轮下来 5 条
+    「已定位但无回应」里有 2 条（`buffer.h:6`/`:7`）属于这种误报，而这一节的全部
+    价值就在于被人当真。
+    只看**声明行里出现的**函数名，不做全文匹配：检查项正文提到某个函数名多半只是
+    顺带一提，用它销账会让记账虚高（同 `_CHECKLIST_LINE_TOLERANCE` 的理由）。
     """
-    covered = {(f.file, f.line) for f in (*findings, *observations)}
-    gaps: list[str] = []
+    if not covered_functions:
+        return False
+    text = c_scanner.line_text_at(scan, item.file, item.line, cache=cache)
+    if not text:
+        return False
+    return any(name in covered_functions for name in c_scanner.DECL_NAME_RE.findall(text))
+
+
+def _checklist_coverage(
+    scan: ScanResult,
+    arch: ModuleArchitecture,
+    findings: list[Finding],
+    observations: list[Finding],
+    *,
+    concern: bool,
+) -> list[Any]:
+    """返回**尚未被回应**的已定位检查项。
+
+    检查项带着 file:line 进来，说明架构阶段已经看见了那里的问题；若检视阶段整条无回应，
+    就是信息在链路上丢失。命中判定的松紧按用途分两档：
+
+    - `concern=False`（最终记账）：位置邻近（±`_CHECKLIST_LINE_TOLERANCE`）或同函数声明
+      行有**任意**结论即算回应。这一节是给人看的督促，**假警报比漏报更有害**（整节误报
+      会让人整体忽略它），故从宽。
+    - `concern=True`（补检触发）：还要求**关切族一致**。从紧是必需的——同一行上可能并存
+      多个都成立的缺陷（实测 `parser.c:13` 上 E07 源指针不推进、E08 缺长度校验、
+      E09 定长拷贝无 NUL 三件事），按位置销账时报了 E07 就把另两件一起抹掉，而它们分别
+      对应上一条已定位检查项。触发补检宁可多问一句，也不能让上游线索这样静默蒸发。
+    """
+    cache: dict[str, list[str]] = {}
+    located = [*findings, *observations]
+    covered = {(f.file, f.line, fu.category_family(f.category)) for f in located}
+    covered_functions = {
+        name
+        for f in located
+        if (name := c_scanner.containing_function_name(scan, f.file, f.line))
+    }
+    open_items: list[Any] = []
     for item in arch.checklist:
         if not (item.file and item.line):
             continue
+        item_family = fu.category_family(item.category)
         if any(
-            file == item.file and abs(line - item.line) <= _CHECKLIST_LINE_TOLERANCE
-            for file, line in covered
+            file == item.file
+            and abs(line - item.line) <= _CHECKLIST_LINE_TOLERANCE
+            and (not concern or family == item_family)
+            for file, line, family in covered
         ):
             continue
-        gaps.append(f"{item.file}:{item.line} [{item.category}] {item.item}")
-    return gaps
+        if _declares_covered_function(scan, item, covered_functions, cache):
+            continue
+        open_items.append(item)
+    return open_items
+
+
+def _checklist_gaps(
+    scan: ScanResult,
+    arch: ModuleArchitecture,
+    findings: list[Finding],
+    observations: list[Finding],
+) -> list[str]:
+    """上游已定位、而本轮既未出 finding 也未出 observation 的检查项（最终记账）。
+
+    只统计与告警，不改写结论——检查项不成立本来就是合格结果，需要人工区分的是
+    「核对过、判定不成立」与「压根没看」。
+    """
+    return [
+        f"{item.file}:{item.line} [{item.category}] {item.item}"
+        for item in _checklist_coverage(scan, arch, findings, observations, concern=False)
+    ]
+
+
+def _open_items_text(scan: ScanResult, items: list[Any]) -> str:
+    """渲染待补检的检查项：每条附上问题行附近的函数片段，供模型就地问答。"""
+    cache: dict[str, list[str]] = {}
+    blocks: list[str] = []
+    for item in items:
+        _, excerpt = c_scanner.function_excerpt(scan, item.file, item.line, cache=cache)
+        context = "\n".join(excerpt.splitlines()[:30]) or "(未取到源码片段)"
+        blocks.append(
+            f"- [{item.category}] {item.item} @{item.file}:{item.line}\n"
+            f"  所在函数片段（行号以 | 左侧为准）：\n{context}"
+        )
+    return "\n\n".join(blocks)
 
 
 def _critical_paths(state: ReviewState, cfg: ReviewConfig) -> list[dict[str, Any]]:
@@ -352,22 +469,46 @@ def _review_module_raw(
     logger.debug("[检视] %s size_class=%s 批次=%d 高风险=%s", module, size_class, len(raw_batches), flagged)
 
     merged, observations, invalid = _enrich_and_split(scan, raw_batches)
+
+    # 检查项闭环：上游架构阶段已定位到 file:line 的检查项，若本轮没有任何**同关切族**
+    # 的结论，就追加一次只针对这些项的小范围补检，并把结果并入同一套 enrich/去重/反驳
+    # 流水线。这修的是信息交接的结构性缺口——原先这些线索只被事后记账，流程里没有任何
+    # 动作去补；同一行上的多个不同缺陷还会因位置销账被一并抹掉。
+    open_items = _checklist_coverage(scan, arch, merged, observations, concern=True)
+    if open_items:
+        logger.info(
+            "[检视] %s 检查项补检触发 %d 条: %s",
+            module,
+            len(open_items),
+            [f"{item.file}:{item.line}" for item in open_items],
+        )
+        repair_prompt = CHECKLIST_REPAIR_PROMPT.format(
+            module_arch=common["module_arch"],
+            open_items=_open_items_text(scan, open_items),
+            source=_truncate(c_scanner.module_source_text(scan, module), 60000),
+        )
+        repair_findings, repair_observations, repair_invalid = _enrich_and_split(
+            scan, [_review_pass(repair_prompt, cfg, "repair")]
+        )
+        merged.extend(repair_findings)
+        observations.extend(repair_observations)
+        invalid.extend(repair_invalid)
     total_raw = len(merged) + len(invalid)
     funnel = ReviewFunnel(
         model_findings=total_raw,
         model_observations=len(observations) - len(invalid),
         location_invalid=len(invalid),
+        checklist_repair=len(open_items),
     )
 
-    # 补漏：工具独立报出、模型完全没提的位置补为候选 finding。这是纯增益的召回提升，
+    # 补漏：工具独立报出、模型完全没提的主张补为候选 finding。这是纯增益的召回提升，
     # 依据是「工具报告 = 该位置确实有问题」；反之（工具没报）绝不作任何推断。
     tool_report = load_tool_evidence(cfg)
     if tool_report.entries:
-        covered = {(f.file, f.line) for f in merged}
-        candidates = _tool_candidates(
+        candidates, tool_redundant, tool_rejected = _tool_candidates(
             scan,
             module_files,
-            covered,
+            merged,
             [e.model_dump() for e in tool_report.entries],
             {},  # 独立缓存：候选数量少，且与上方批次解析无共享收益
         )
@@ -380,6 +521,16 @@ def _review_module_raw(
             )
             merged.extend(candidates)
         funnel.tool_added = len(candidates)
+        funnel.tool_redundant = tool_redundant
+        funnel.tool_rejected = tool_rejected
+        if tool_redundant or tool_rejected:
+            logger.debug(
+                "[检视] %s 工具候选弃用 %d 条（与既有主张重复 %d，位置校验未通过 %d）",
+                module,
+                tool_redundant + tool_rejected,
+                tool_redundant,
+                tool_rejected,
+            )
 
     # 去重：同一锚点 + 同一缺陷种类算同一主张。按行号归并会丢掉同一语句上的不同缺陷
     # （实测 parser.c:13 上并存三个都成立的缺陷），故只在主张级别合并。
@@ -405,16 +556,18 @@ def _review_module_raw(
     # observations：去重、剔除与已确认主张重复的条目、重编号。
     # 原实现只给 findings 重编号，observations 保留各批次自赋的 o1..oN，
     # 而每个批次都被要求「全局唯一」——跨批次不可能做到，实测三个模块全部出现 id 冲突。
-    covered = {fu.claim_key(f.model_dump()) for f in final_findings}
-    seen_obs: set[tuple[str, str]] = set()
+    # 用 `claims_match` 判重（而非精确 claim_key）：同一处缺陷在不同批次/补检里可能一次
+    # 带具体 defect_kind、一次只是族哨兵，精确键会把它们当两条，观察项会与结论重复出现。
+    finding_dicts = [f.model_dump() for f in final_findings]
     kept_observations: list[Finding] = []
     redundant = 0
     for observation in observations:
-        key = fu.claim_key(observation.model_dump())
-        if key in covered or key in seen_obs:
+        obs = observation.model_dump()
+        if any(fu.claims_match(f, obs) for f in finding_dicts) or any(
+            fu.claims_match(prev.model_dump(), obs) for prev in kept_observations
+        ):
             redundant += 1
             continue
-        seen_obs.add(key)
         kept_observations.append(observation)
     kept_observations.sort(key=lambda o: (fu.severity_rank(o.severity), o.file, o.line))
     for idx, observation in enumerate(kept_observations, 1):
@@ -434,7 +587,7 @@ def _review_module_raw(
         redundant,
         len(invalid),
     )
-    gaps = _checklist_gaps(arch, final_findings, kept_observations)
+    gaps = _checklist_gaps(scan, arch, final_findings, kept_observations)
     logger.info(
         "[检视] %s findings=%d observations=%d%s%s",
         module,

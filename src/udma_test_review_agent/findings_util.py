@@ -157,6 +157,16 @@ def category_family(value: Any) -> str:
     return "logic"
 
 
+def _resolve_kind(value: Any, category: Any) -> str:
+    """把自由书写的缺陷种类收敛到闭集；无法归类时回退族哨兵 `family:<族>`。"""
+    raw = _norm_token(value)
+    if raw in DEFECT_KINDS:
+        return raw
+    if raw in _KIND_SYNONYMS:
+        return _KIND_SYNONYMS[raw]
+    return f"family:{category_family(category)}"
+
+
 def defect_kind(finding: dict[str, Any]) -> str:
     """取缺陷种类；模型未给或不在闭集内时，回退到**族限定的哨兵** `family:<族>`。
 
@@ -164,12 +174,53 @@ def defect_kind(finding: dict[str, Any]) -> str:
     都落在 `resource.c:12`，若二者都回退成 `other` 就会被判为同一主张而合并——
     两个不同性质的缺陷丢掉一个。`family:<族>` 保证不同族永不因缺字段而互相合并。
     """
-    raw = _norm_token(finding.get("defect_kind"))
-    if raw in DEFECT_KINDS:
-        return raw
-    if raw in _KIND_SYNONYMS:
-        return _KIND_SYNONYMS[raw]
-    return f"family:{category_family(finding.get('category'))}"
+    return _resolve_kind(finding.get("defect_kind"), finding.get("category"))
+
+
+def kinds_overlap(kind_a: Any, category_a: Any, kind_b: Any, category_b: Any) -> bool:
+    """两种缺陷种类是否指向**同一类缺陷**。
+
+    规则按「谁有分类信息」分层：
+
+    - 两侧都是显式种类：只认同名。同族的 `null_deref` 与 `unbounded_write` 是两件事，
+      不得合并（实测 `parser.c:13` 一行并存多个都成立的缺陷）。
+    - 两侧都是族哨兵：只在**同族**时合并。哨兵的含义是「知道族、说不出类」，跨族就是
+      两件事——这是哨兵用族名而非 `other` 的理由。
+    - 一侧哨兵、一侧显式：合并。哨兵一侧连族都可能标错（实测同一处 `strcpy` 在首轮标
+      `ub`、在补检标 `memory`，family 因此不等，但显然是同一缺陷），此时以显式一侧为准。
+
+    最后一条是补检暴露的真实重复：首轮漏填 `defect_kind` 的条目与补检填了的同一缺陷，
+    此前因 `family:ub` ≠ `unbounded_write` 被判成两条，在同一张卡下列出两段几乎相同的
+    主张。风险是「同一行两个真不同缺陷、且恰好一个没分类」会被并掉；但那种情况下哨兵
+    的族本已不可信，无法据它区分，合并是较小恶。
+    """
+    resolved_a = _resolve_kind(kind_a, category_a)
+    resolved_b = _resolve_kind(kind_b, category_b)
+    if resolved_a == resolved_b:
+        return True
+    a_sentinel = resolved_a.startswith("family:")
+    b_sentinel = resolved_b.startswith("family:")
+    if a_sentinel and b_sentinel:
+        return category_family(category_a) == category_family(category_b)
+    if a_sentinel or b_sentinel:
+        return True
+    return False
+
+
+def claims_match(left: dict[str, Any], right: dict[str, Any], *, tolerance: int = 0) -> bool:
+    """两条 finding 是否为**同一主张**：同一处语句且同一类缺陷。
+
+    运行内默认 `tolerance=0`（精确锚点），与 `group_by_anchor` 的理由一致：模型有意分别
+    指认的相邻两条语句应按两条处理。跨运行匹配才放大容差。
+    """
+    if not anchors_match(left, right, tolerance=tolerance):
+        return False
+    return kinds_overlap(
+        left.get("defect_kind"),
+        left.get("category"),
+        right.get("defect_kind"),
+        right.get("category"),
+    )
 
 
 # ---------------------------------------------------------------- 锚点身份
@@ -248,22 +299,20 @@ def claim_key(finding: dict[str, Any]) -> tuple[str, str]:
 
 
 def dedup_claims(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把**同一锚点且同一种类**的条目合并为一条，其余原样保留。
+    """把**同一主张**（同一锚点且同类缺陷）的条目合并为一条，其余原样保留。
 
-    替换原先的 `(file, line // 10, category)` 键。旧键有两处错：`//10` 让相差 1 行的
-    同一缺陷跨桶分裂、也让相邻的不同缺陷被吞并；含 `category` 又让同一缺陷换个标签
-    就不能合并。新键在锚点内按闭集种类区分，两个方向都不误伤。
+    用 `claims_match` 而非精确键相等：同一处缺陷在不同批次/补检里可能一次给了具体
+    `defect_kind`、一次只是族哨兵，精确键会把它们判成两条。合并顺序为输入序，先到者
+    为基准；`merge_same_claim` 会把显式种类保留下来，不让哨兵覆盖掉它。
     """
     merged: list[dict[str, Any]] = []
-    index_of: dict[tuple[str, str], int] = {}
     for finding in findings:
-        key = claim_key(finding)
-        slot = index_of.get(key)
-        if slot is None:
-            index_of[key] = len(merged)
+        for index, existing in enumerate(merged):
+            if claims_match(existing, finding):
+                merged[index] = merge_same_claim([existing, finding])
+                break
+        else:
             merged.append(finding)
-            continue
-        merged[slot] = merge_same_claim([merged[slot], finding])
     return merged
 
 
@@ -293,6 +342,14 @@ def merge_same_claim(claims: list[dict[str, Any]]) -> dict[str, Any]:
     canonical["severity"] = worst_severity(item.get("severity") for item in claims)
     canonical["merged_from"] = origin_ids if len(origin_ids) > 1 else []
     canonical["source_pass"] = "+".join(passes)
+    # 规范条目若只带族哨兵，而组内有人给了具体种类，则采用具体种类：
+    # 哨兵是「知道族、说不出类」，不应把更精确的同类主张降级覆盖。
+    if _resolve_kind(canonical.get("defect_kind"), canonical.get("category")).startswith("family:"):
+        for item in claims:
+            resolved = _resolve_kind(item.get("defect_kind"), item.get("category"))
+            if not resolved.startswith("family:"):
+                canonical["defect_kind"] = resolved
+                break
     return canonical
 
 
