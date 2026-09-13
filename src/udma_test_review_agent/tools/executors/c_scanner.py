@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from ...log import get_logger
 from ...module_map import id_sort_key
@@ -278,3 +278,100 @@ def upstream_callers(scan: ScanResult, function_name: str) -> list[str]:
         for edge in scan.call_graph
         if edge.callee == function_name
     ]
+
+
+def function_excerpt(
+    scan: ScanResult,
+    rel_path: str,
+    line: int,
+    *,
+    context: int = 60,
+    cache: dict[str, list[str]] | None = None,
+) -> tuple[str, str]:
+    """返回 (函数名, 以 `line` 为中心的带行号代码片段)。
+
+    **必须以问题行为中心，而不是从函数头截断。** 原实现把函数源码截到 6000 字符、
+    从头保留：长函数里位于尾部的 finding，提示词里根本不含它所指的语句，
+    反驳只能写「证据不足」或误判——这直接打在召回上。样例工程的函数只有 3-5 行，
+    所以此前从未暴露，真实工程上必然触发。
+    """
+    name, _ = containing_function_code(scan, rel_path, line)
+    lines = _file_lines(scan, rel_path, cache)
+    if not lines:
+        return name, ""
+    start = max(1, line - context)
+    end = min(len(lines), line + context)
+    excerpt = "\n".join(f"{i:>5}| {lines[i - 1]}" for i in range(start, end + 1))
+    return name, excerpt
+
+
+def normalize_path(scan: ScanResult, rel_path: str) -> str:
+    """把 finding 里的文件路径归一到扫描产物中的相对路径；无法唯一确定时返回空串。
+
+    模型会写成 `./buffer.c`、`buffer.c`、`src/buffer.c` 等多种形式。不归一化会让
+    位置校验把所有 finding 判为「文件不在扫描范围」，看起来像灾难性失败，
+    实际只是路径写法差异。
+    """
+    candidate = str(rel_path or "").replace("\\", "/").strip()
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    known = {f.path for m in scan.modules for f in m.files}
+    if candidate in known:
+        return candidate
+    base = PurePosixPath(candidate).name
+    matches = sorted(p for p in known if PurePosixPath(p).name == base)
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _file_lines(scan: ScanResult, rel_path: str, cache: dict[str, list[str]] | None) -> list[str]:
+    """按文件读取源码行；带缓存以免逐条 finding 重复读盘。"""
+    store = cache if cache is not None else {}
+    if rel_path not in store:
+        root = Path(scan.project_root)
+        try:
+            store[rel_path] = (root / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            store[rel_path] = []
+    return store[rel_path]
+
+
+def classify_location(
+    scan: ScanResult, rel_path: str, line: int, *, cache: dict[str, list[str]] | None = None
+) -> dict[str, str]:
+    """判定 finding 位置的可核验性，返回 `{status, reason, path, line_text}`。
+
+    **三值而非二值**，因为「文本级扫描器找不到所属函数」与「位置根本不存在」是两回事：
+
+    - `verified`       —— 文件在扫描范围内、行号有效、且落在某个已识别函数体内；
+    - `unattributable` —— 位置真实存在，但定位不到所属函数。头文件声明（`void f(int);`
+      以 `;` 结尾，不满足函数签名识别条件）、文件作用域的全局/静态表、宏、
+      以及**签名换行的多行函数**都会落在这里。这是扫描器的能力边界，**不是模型错误**：
+      按「无效」处理会把整类真实缺陷（头文件契约缺陷等）系统性丢掉；
+    - `invalid`        —— 文件不在扫描范围、行号越界、或该行是空行/纯注释。只有这一类
+      属于模型的定位错误。
+    """
+    path = normalize_path(scan, rel_path)
+    if not path:
+        return {"status": "invalid", "reason": "文件不在扫描范围内", "path": "", "line_text": ""}
+
+    line_count = next((f.lines for m in scan.modules for f in m.files if f.path == path), 0)
+    if line < 1 or (line_count and line > line_count):
+        return {"status": "invalid", "reason": f"行号 {line} 超出文件范围(1..{line_count})", "path": path, "line_text": ""}
+
+    lines = _file_lines(scan, path, cache)
+    text = lines[line - 1] if 0 < line <= len(lines) else ""
+    stripped = text.strip()
+    if not stripped:
+        return {"status": "invalid", "reason": "该行为空行", "path": path, "line_text": text}
+    if stripped.startswith(("/*", "*", "//")):
+        return {"status": "invalid", "reason": "该行为注释", "path": path, "line_text": text}
+
+    name, _ = containing_function_code(scan, path, line)
+    if name:
+        return {"status": "verified", "reason": f"位于函数 {name} 内", "path": path, "line_text": text}
+    return {
+        "status": "unattributable",
+        "reason": "位置存在但文本级扫描器无法定位所属函数（头文件声明/宏/多行签名/文件作用域）",
+        "path": path,
+        "line_text": text,
+    }

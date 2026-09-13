@@ -16,40 +16,77 @@ from ..common import (
     _config,
     _execute_batch,
     _findings_verified_path,
+    _module_arch_path,
     _read_json,
     _stats,
-    _truncate,
 )
 from ._base import _llm
 
 logger = get_logger(__name__)
 
 
-def _finding_block(scan: ScanResult, finding: Finding) -> str:
-    func_name, function_code = c_scanner.containing_function_code(scan, finding.file, finding.line)
+def _finding_block(scan: ScanResult, finding: Finding, cache: dict[str, list[str]]) -> str:
+    # 以问题行为中心取片段（而非从函数头截断）：长函数尾部的 finding 否则会拿到
+    # 一份不含该语句的「上下文」，反驳只能写证据不足或误判。
+    func_name, excerpt = c_scanner.function_excerpt(scan, finding.file, finding.line, cache=cache)
     callers = c_scanner.upstream_callers(scan, func_name) if func_name else []
     logger.debug(
-        "[反驳] 入批 %s 位置=%s:%d 定位函数=%s 函数代码字符=%d 上游调用点=%d",
+        "[反驳] 入批 %s 位置=%s:%d 定位函数=%s 片段字符=%d 上游调用点=%d",
         finding.id,
         finding.file,
         finding.line,
         func_name or "(未定位)",
-        len(function_code),
+        len(excerpt),
         len(callers),
     )
+    payload = finding.model_dump()
     return (
         f"### id={finding.id}\n"
-        f"finding: {json.dumps(finding.model_dump(), ensure_ascii=False)}\n"
-        f"所在函数（{func_name or '未定位'}）：\n{_truncate(function_code, 6000) or '(未定位到所在函数)'}\n"
+        f"finding: {json.dumps(payload, ensure_ascii=False)}\n"
+        f"问题行上下文（{func_name or '未定位所属函数'}，行号以 | 左侧为准）：\n"
+        f"{excerpt or '(未取到源码片段)'}\n"
         f"上游调用点：\n" + ("\n".join(callers) or "(调用图中无上游调用点，可能为入口函数或近似调用图未覆盖)")
     )
 
 
-def _batch_rebut(scan: ScanResult, findings: list[Finding], cfg) -> dict[str, Verdict]:
+def _arch_brief(cfg: ReviewConfig, module: str) -> str:
+    """读取本模块架构，作为反驳判定豁免时的契约依据。
+
+    反驳提示词第六章的豁免规则（调用方负责加锁、参数已由上游校验、非边界函数）
+    全部以模块契约为前提，而原实现只传 `{findings}`：模型被要求套用豁免，
+    却拿不到定义豁免的那份契约，于是对契约类断言一律倾向 refuted——
+    实测这正是 `M01 f6`、`M02 f4` 被推翻的直接原因。
+    """
+    path = _module_arch_path(cfg, module)
+    if not path.exists():
+        logger.warning("[反驳] %s 缺少架构产物，豁免判定将缺少契约依据: %s", module, path)
+        return "(本模块架构不可用)"
+    arch = json.loads(path.read_text(encoding="utf-8"))
+    contract = arch.get("concurrency_contract") or {}
+    lines = [
+        f"职责：{arch.get('responsibility', '')}",
+        "接口契约：",
+    ]
+    for interface in arch.get("interfaces", []) or []:
+        lines.append(
+            f"  - {interface.get('signature', '')} @{interface.get('file', '')}:{interface.get('line', 0)} "
+            f"前置条件={interface.get('precondition') or '未声明'} "
+            f"已校验={interface.get('input_validated')} 边界={interface.get('is_boundary')}"
+        )
+    lines.append(
+        f"并发契约：线程模型={contract.get('thread_model', '未声明')}；"
+        f"调用方负责加锁={contract.get('caller_locked') or '无'}；"
+        f"内部持锁边界={contract.get('internal_locks') or '无'}"
+    )
+    return "\n".join(lines)
+
+
+def _batch_rebut(scan: ScanResult, findings: list[Finding], cfg, module_arch: str) -> dict[str, Verdict]:
     """对给定 findings 发起一次批量反驳，返回 {id: Verdict}（仅保留被请求的 id）。"""
-    blocks = [_finding_block(scan, finding) for finding in findings]
+    cache: dict[str, list[str]] = {}
+    blocks = [_finding_block(scan, finding, cache) for finding in findings]
     valid_ids = {finding.id for finding in findings}
-    prompt = REBUTTAL_BATCH_PROMPT.format(findings="\n\n".join(blocks))
+    prompt = REBUTTAL_BATCH_PROMPT.format(findings="\n\n".join(blocks), module_arch=module_arch)
     logger.debug("[反驳] 批量请求 findings=%d prompt_chars=%d", len(findings), len(prompt))
     report = _llm(prompt, RebuttalReport, cfg)
     verdicts: dict[str, Verdict] = {}
@@ -85,10 +122,11 @@ def _rebuttal_one(
     started = time.monotonic()
     logger.debug("[反驳] %s 原始findings=%d 产物=%s", module, len(findings), verified_path)
 
+    module_arch = _arch_brief(cfg, module)
     verdicts: dict[str, Verdict] = {}
     retried = False
     if findings:
-        verdicts = _batch_rebut(scan, findings, cfg)
+        verdicts = _batch_rebut(scan, findings, cfg, module_arch)
         missing = [finding for finding in findings if finding.id not in verdicts]
         if missing:
             retried = True
@@ -98,7 +136,7 @@ def _rebuttal_one(
                 len(missing),
                 [finding.id for finding in missing],
             )
-            verdicts.update(_batch_rebut(scan, missing, cfg))
+            verdicts.update(_batch_rebut(scan, missing, cfg, module_arch))
         for finding in findings:
             if finding.id not in verdicts:
                 logger.warning("[反驳] %s %s 重新请求后仍缺失，标记 uncertain", module, finding.id)

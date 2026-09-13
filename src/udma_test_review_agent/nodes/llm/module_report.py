@@ -1,8 +1,11 @@
 """单模块 Markdown 格式化节点：确定性渲染 + LLM 执行摘要，落盘 <ID>/report.md。
 
 文档结构：标题与规模 → 执行摘要 → 汇总（确定性统计）→ 已确认问题卡片 →
-待人工确认卡片 → 观察项卡片 → 已否定问题卡片（与被确认卡片同格式，置于文末）。
-四类条目统一采用标准卡片格式。
+待人工确认卡片 → 观察项表 → 已否定问题卡片。
+
+**按锚点归并出卡**：同一语句上可能并存多个都成立的不同缺陷（实测 `parser.c:13` 上
+三个），逐条出卡会让 23 行的模块渲染出 15 张卡片。归并后同一语句只占一张卡，
+卡内列出各条主张及其各自结论——既降噪又不丢信息（不合并主张本身，见 `findings_util`）。
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ... import findings_util as fu
 from ...configuration import ReviewConfig
 from ...llm import stream_llm_once
 from ...log import get_logger
@@ -23,14 +27,23 @@ logger = get_logger(__name__)
 
 SEVERITY_ORDER = {"致命": 0, "严重": 1, "一般": 2, "提示": 3}
 
+SUMMARY_FILE = "summary.md"
+"""模块摘要副本。总报告按自己的链接基准重渲染卡片，需要单独取用摘要文本。"""
 
-def _location_link(project_root: str, report_dir: Path, file: str, line: int) -> str:
-    """生成可点击的 file:line 链接；无法计算相对路径时退化为行内代码。"""
+
+def _location_link(project_root: str, link_base: Path, file: str, line: int) -> str:
+    """生成可点击的 file:line 链接；`link_base` 是**该 Markdown 将被阅读时所在目录**。
+
+    这个参数必须由调用方按消费方传入：模块报告在 `<模块>/report.md`，总报告在
+    `<输出根>/report.md`，两者到被测源码的相对层级不同。原实现固定按模块目录计算，
+    而 `report.py` 又把模块 Markdown **原样内联**进总报告——模块报告自身的链接是对的，
+    内联后每一条都错两级。故总报告改为用正确的基准重新渲染，而非内联。
+    """
     text = f"{file}:{line}"
-    if not project_root:
+    if not project_root or not file:
         return f"`{text}`"
     try:
-        rel = os.path.relpath(Path(project_root) / file, report_dir)
+        rel = os.path.relpath(Path(project_root) / file, link_base)
     except (OSError, ValueError):
         return f"`{text}`"
     return f"[{text}]({rel}#L{line})"
@@ -39,9 +52,8 @@ def _location_link(project_root: str, report_dir: Path, file: str, line: int) ->
 def _severity_counts(results: list[dict]) -> dict[str, int]:
     counts = {"致命": 0, "严重": 0, "一般": 0, "提示": 0}
     for item in results:
-        severity = item["verdict"].get("severity", "")
-        if severity in counts:
-            counts[severity] += 1
+        severity = fu.norm_severity(item["verdict"].get("severity"))
+        counts[severity] = counts.get(severity, 0) + 1
     return counts
 
 
@@ -51,39 +63,107 @@ def _rebuttal_opinion(verdict: dict | None) -> str:
     return verdict.get("rebuttal_opinion") or verdict.get("refutation_log", "")
 
 
-def _finding_card(
-    index: int,
-    finding: dict,
-    verdict: dict | None,
-    conclusion: str,
-    project_root: str,
-    report_dir: Path,
-) -> list[str]:
-    location = _location_link(project_root, report_dir, finding["file"], finding["line"])
-    severity = (verdict or {}).get("severity") or finding.get("severity", "")
+def _anchor_of(finding: dict) -> str:
+    return str(finding.get("anchor") or f"{finding.get('file', '?')}:{finding.get('line', 0)}")
+
+
+def _claim_block(ordinal: str, finding: dict, verdict: dict | None) -> list[str]:
+    """单条主张的内容块（描述/根因/修复/影响/证据）。"""
     chain = " → ".join(finding.get("call_chain") or [])
     evidence = finding.get("evidence", "")
     tail = f"{evidence}" + (f" ｜ {chain}" if chain else "")
-    return [
-        f"### {index} · [{severity}] {finding['title']}",
+    kind = fu.defect_kind(finding)
+    lines = [f"**[{ordinal}] {finding.get('title', '')}**", ""]
+    lines += [f"- **问题描述**：{finding.get('description', '')}", f"- **根因分析**：{finding.get('root_cause', '')}"]
+    lines += [f"- **修复方案**：{finding.get('suggestion', '')}", f"- **影响**：{finding.get('impact', '')}"]
+    lines += [f"- **证据与调用链**：{tail or '（无）'}", f"- **反驳意见**：{_rebuttal_opinion(verdict)}"]
+    if kind.startswith("family:"):
+        kind = f"{finding.get('category', '')}（未归类）"
+    lines += [f"- **缺陷种类**：{kind}", ""]
+    tool = finding.get("tool_evidence") or []
+    if tool:
+        lines += ["- **工具印证**：" + "；".join(str(t) for t in tool), ""]
+    return lines
+
+
+def _finding_card(
+    index: int,
+    group: list[dict],
+    conclusion: str,
+    project_root: str,
+    link_base: Path,
+) -> list[str]:
+    """一张卡片 = 一个锚点。组内多条主张按各自结论分行列出。"""
+    head = group[0]
+    location = _location_link(project_root, link_base, head.get("file", ""), int(head.get("line") or 0))
+    severity = fu.worst_severity(
+        (item.get("verdict") or {}).get("severity") or item.get("severity") for item in group
+    )
+    categories = "、".join(sorted({fu.category_family(item["finding"].get("category")) for item in group}))
+    lines = [
+        f"### {index} · [{severity}] {head['finding'].get('title', '')}",
         "",
-        f"> **位置** {location} ｜ **类别** {finding['category']} ｜ **结论** {conclusion}",
-        "",
-        f"**问题描述**：{finding.get('description', '')}",
-        "",
-        f"**根因分析**：{finding.get('root_cause', '')}",
-        "",
-        f"**修复方案**：{finding.get('suggestion', '')}",
-        "",
-        f"**影响**：{finding.get('impact', '')}",
-        "",
-        f"**证据与调用链**：{tail}",
-        "",
-        f"**反驳意见**：{_rebuttal_opinion(verdict)}",
-        "",
-        "---",
+        f"> **位置** {location} ｜ **类别** {categories} ｜ **结论** {conclusion}"
+        + (f" ｜ **本行共 {len(group)} 条主张**" if len(group) > 1 else ""),
         "",
     ]
+    inconsistent = [i for i in group if i["verdict"].get("inconsistent")]
+    if inconsistent:
+        lines += [
+            "> ⚠️ **同一主张存在互相冲突的结论**，已降为 uncertain 并保留全部分歧原文，需人工裁决。",
+            "",
+        ]
+    for ordinal, item in enumerate(group, 1):
+        if len(group) > 1:
+            lines += [f"#### 主张 {index}.{ordinal}", ""]
+        lines += _claim_block(f"{index}.{ordinal}" if len(group) > 1 else str(index), item["finding"], item["verdict"])
+    lines += ["---", ""]
+    return lines
+
+
+def _observation_table(observations: list[dict], project_root: str, link_base: Path) -> list[str]:
+    """观察项用紧凑表格呈现。
+
+    原来观察项与被确认问题用**完全相同的卡片格式**渲染，唯一区别只是「反驳意见」一行
+    写着「未进入反驳流程」。实测观察项数量（19）与 findings（21）相当，读者必须逐张
+    卡片才能分辨哪些经过验证——表格让「未经核验」这件事在视觉上就无法忽略。
+    """
+    if not observations:
+        return ["（无）", ""]
+    lines = [
+        "> 以下条目**未进入反驳流程**，证据链不完整，仅供人工排查线索，不作为结论。",
+        "",
+        "| # | 位置 | 类别 | 严重度 | 问题 |",
+        "|---|---|---|---|---|",
+    ]
+    for idx, obs in enumerate(observations, 1):
+        location = _location_link(project_root, link_base, obs.get("file", ""), int(obs.get("line") or 0))
+        title = str(obs.get("title", "")).replace("|", "\\|")
+        description = str(obs.get("description", "")).replace("|", "\\|")
+        note = f"{title}——{description}" if description else title
+        lines.append(
+            f"| {idx} | {location} | {fu.category_family(obs.get('category'))} | "
+            f"{fu.norm_severity(obs.get('severity'))} | {note} |"
+        )
+    lines += [""]
+    return lines
+
+
+def _grouped_cards(
+    items: list[dict], conclusion: str, start: int, project_root: str, link_base: Path
+) -> tuple[list[str], int]:
+    """按锚点归并出卡，返回 (markdown 行, 下一张卡片的序号)。"""
+    lines: list[str] = []
+    index = start
+    if not items:
+        return ["（无）", ""], index
+    findings = [item["finding"] for item in items]
+    for group_indices in fu.group_by_anchor(findings):
+        index += 1
+        group = [items[i] for i in group_indices]
+        group.sort(key=lambda i: fu.severity_rank((i.get("verdict") or {}).get("severity") or i["finding"].get("severity")))
+        lines += _finding_card(index, group, conclusion, project_root, link_base)
+    return lines, index
 
 
 def render_module_report(
@@ -99,10 +179,7 @@ def render_module_report(
     confirmed = [r for r in results if r["verdict"]["conclusion"] == "confirmed"]
     uncertain = [r for r in results if r["verdict"]["conclusion"] == "uncertain"]
     refuted = [r for r in results if r["verdict"]["conclusion"] == "refuted"]
-    confirmed.sort(key=lambda r: SEVERITY_ORDER.get(r["verdict"].get("severity"), 9))
-    uncertain.sort(key=lambda r: SEVERITY_ORDER.get(r["verdict"].get("severity"), 9))
-    refuted.sort(key=lambda r: SEVERITY_ORDER.get(r["verdict"].get("severity"), 9))
-    observations = sorted(observations, key=lambda o: SEVERITY_ORDER.get(o.get("severity"), 9))
+    observations = sorted(observations, key=lambda o: fu.severity_rank(o.get("severity")))
     counts = _severity_counts(results)
 
     lines = [f"# {module} 检视问题说明", ""]
@@ -128,34 +205,20 @@ def render_module_report(
     ]
 
     index = 0
-
     lines += ["## 已确认问题（confirmed）", ""]
-    if not confirmed:
-        lines += ["（无）", ""]
-    for item in confirmed:
-        index += 1
-        lines += _finding_card(index, item["finding"], item["verdict"], "confirmed", project_root, report_dir)
+    cards, index = _grouped_cards(confirmed, "confirmed", index, project_root, report_dir)
+    lines += cards
 
     lines += ["## 待人工确认（uncertain）", ""]
-    if not uncertain:
-        lines += ["（无）", ""]
-    for item in uncertain:
-        index += 1
-        lines += _finding_card(index, item["finding"], item["verdict"], "uncertain", project_root, report_dir)
+    cards, index = _grouped_cards(uncertain, "uncertain", index, project_root, report_dir)
+    lines += cards
 
     lines += ["## 观察项（observation）", ""]
-    if not observations:
-        lines += ["（无）", ""]
-    for obs in observations:
-        index += 1
-        lines += _finding_card(index, obs, None, "observation", project_root, report_dir)
+    lines += _observation_table(observations, project_root, report_dir)
 
-    lines += ["## 已否定问题（refuted，与被确认问题同格式）", ""]
-    if not refuted:
-        lines += ["（无）", ""]
-    for item in refuted:
-        index += 1
-        lines += _finding_card(index, item["finding"], item["verdict"], "refuted", project_root, report_dir)
+    lines += ["## 已否定问题（refuted）", ""]
+    cards, index = _grouped_cards(refuted, "refuted", index, project_root, report_dir)
+    lines += cards
 
     return "\n".join(lines)
 
@@ -183,6 +246,9 @@ def _module_report_one(cfg: ReviewConfig, state: ReviewState, module: str) -> di
         logger.warning("[模块报告] %s 摘要生成失败: %s", module, exc)
     module_md = render_module_report(module, payload, size_info, cfg.project_root, report_path.parent, summary=summary)
     report_path.write_text(module_md, encoding="utf-8")
+    # 摘要另存一份：总报告需要用**自己的**链接基准重新渲染各模块卡片（见 report.py），
+    # 若只把模块 Markdown 内联过去，其中的相对链接会全部指错目录。
+    (_module_dir(cfg, module) / SUMMARY_FILE).write_text(summary, encoding="utf-8")
     logger.info("[模块报告] %s 完成 耗时%.1fs 产物=%s", module, time.monotonic() - started, report_path)
     return {}
 

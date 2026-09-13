@@ -149,9 +149,33 @@ def _prompt_digest(text: str) -> str:
     return f"{text[:PROMPT_DIGEST_LEN]}...({len(text)}字)"
 
 
+def _strip_deterministic(node: object) -> object:
+    """从 JSON Schema 中剔除标记为 `deterministic` 的属性。
+
+    这些字段（锚点、指纹、来源批次、校验状态）由流水线填写，模型无从得知。
+    若留在注入的 schema 里，模型会被要求编造它们——要么产出无意义的占位值，
+    要么把注意力从真正的判断上引开。递归处理 `$defs` 与嵌套对象。
+    """
+    if isinstance(node, dict):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            dropped = [name for name, spec in properties.items() if isinstance(spec, dict) and spec.get("deterministic")]
+            for name in dropped:
+                properties.pop(name)
+            required = node.get("required")
+            if isinstance(required, list):
+                node["required"] = [name for name in required if name not in dropped]
+        for value in node.values():
+            _strip_deterministic(value)
+    elif isinstance(node, list):
+        for value in node:
+            _strip_deterministic(value)
+    return node
+
+
 def _apply_json_constraint(prompt: str, schema: type[BaseModel]) -> tuple[str, dict]:
     """将 schema 描述注入 prompt，并返回 json_object 响应约束。"""
-    schema_desc = json.dumps(schema.model_json_schema(), ensure_ascii=False)
+    schema_desc = json.dumps(_strip_deterministic(schema.model_json_schema()), ensure_ascii=False)
     constrained_prompt = (
         f"{prompt}\n\n要求：仅输出一个 JSON 对象，不要输出任何其他文本，"
         f"结构须符合以下 JSON Schema：\n{schema_desc}"

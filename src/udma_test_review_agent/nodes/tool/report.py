@@ -11,10 +11,12 @@ from ..common import (
     _config,
     _findings_verified_path,
     _module_dir,
+    _module_size_path,
     _output_dir,
     _read_json,
     _stats,
 )
+from ..llm.module_report import SUMMARY_FILE, render_module_report
 
 logger = get_logger(__name__)
 
@@ -28,6 +30,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
     failures = dict(state.get("module_failures") or {})
     sections = []
     stats_rows = []
+    output_dir = _output_dir(cfg)
     total = {"confirmed": 0, "refuted": 0, "uncertain": 0, "observations": 0}
     for module in order:
         if module in failures:
@@ -48,11 +51,15 @@ def report_node(state: ReviewState) -> dict[str, Any]:
             f"| {module} | {len(payload['results'])} | {counts['confirmed']} | {counts['refuted']} | "
             f"{counts['uncertain']} | {counts['observations']} |"
         )
-        module_report_path = _module_dir(cfg, module) / "report.md"
-        module_md = (
-            module_report_path.read_text(encoding="utf-8")
-            if module_report_path.exists()
-            else f"# 模块检视报告: {module}\n\n（模块报告缺失）"
+        # **按总报告自己的链接基准重新渲染**，而不是内联模块报告 Markdown：
+        # 模块报告里的相对链接是按 <模块>/ 目录算的，原样内联到 <输出根>/report.md
+        # 会让每一条链接都指错目录。摘要从副本取回，内容不丢。
+        size_path = _module_size_path(cfg, module)
+        size_info = _read_json(size_path) if size_path.exists() else None
+        summary_path = _module_dir(cfg, module) / SUMMARY_FILE
+        summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+        module_md = render_module_report(
+            module, payload, size_info, cfg.project_root, output_dir, summary=summary
         )
         logger.debug(
             "[报告] %s results=%d confirmed=%d refuted=%d uncertain=%d observations=%d",
@@ -65,7 +72,18 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         )
         sections.append(f"## 模块: {module}\n\n{module_md}")
 
-    overall = ["# 项目检视总报告", "", "## 汇总统计", ""]
+    overall = ["# 项目检视总报告", "", "## 本次运行", ""]
+    # 溯源：原报告完全没有记录用了什么模型、什么阈值、看了哪份源码，
+    # 事后无法回答「这份结论是怎么来的」，也无法判断是否可与上一版比较。
+    overall += [
+        f"- 被测项目：`{cfg.project_root}`",
+        f"- 模块选择：{cfg.modules} ｜ 模块数 {len(order)} ｜ 并发上限 {cfg.max_parallel or '自动'}",
+        f"- 模型配置：{cfg.model_profile or '(active)'} ｜ 小模块行数阈值 {cfg.small_module_line_threshold} ｜ "
+        f"单次上限 {cfg.max_findings_per_pass} ｜ 确认置信度阈值 {cfg.confirmed_confidence_threshold}",
+        f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+    ]
+    overall += ["## 汇总统计", ""]
     overall += [
         "| 模块 | 原始 | confirmed | refuted | uncertain | observations |",
         "|---|---|---|---|---|---|",

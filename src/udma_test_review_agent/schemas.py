@@ -1,8 +1,23 @@
-"""评审流程各阶段的结构化产物模型（全部经 schema 校验）。"""
+"""评审流程各阶段的结构化产物模型（全部经 schema 校验）。
+
+关于 `deterministic=True`
+-----------------------
+标了该标记的字段是**流水线自己填的**（锚点、来源批次、校验状态等），不是模型的输出契约。
+`llm.py::_apply_json_constraint` 会把它们从注入提示词的 JSON Schema 里剔除，
+避免模型被要求编造 `anchor_fingerprint` 这类它无从得知的值。它们仍参与落盘与校验。
+"""
 
 from __future__ import annotations
 
 from pydantic import BaseModel, Field
+
+ARTIFACT_VERSION = 2
+"""产物格式版本。断点续跑靠产物存在性判断，**改了 id 语义就必须升版本**：
+否则续跑会把旧格式的 `f1` 序号与新的锚点 id 混在同一批产物里，两边都不再自洽。
+各阶段的断点命中前先比对版本，不符即重算该阶段（见 `nodes/common.py::_artifact_stale`）。"""
+
+DETERMINISTIC = {"deterministic": True}
+"""标记「该字段由流水线填写、不进模型输出契约」。"""
 
 
 class SourceFileInfo(BaseModel):
@@ -99,6 +114,9 @@ class ModuleConcurrencyContract(BaseModel):
 class ChecklistItem(BaseModel):
     category: str = Field(description="memory/concurrency/trust_boundary/resource/logic/macro/ub 之一")
     item: str
+    file: str = Field(default="", description="该检查项对应的具体文件；无法落到行级时留空")
+    line: int = Field(default=0, description="该检查项对应的具体行号；无法落到行级时为 0")
+    evidence: str = Field(default="", description="支撑该检查项的代码依据（带行号的语句）")
 
 
 class ModuleArchitecture(BaseModel):
@@ -151,6 +169,31 @@ class Finding(BaseModel):
     line: int
     call_chain: list[str] = Field(description="从入口到问题点的调用链，file:line 形式；无法给出完整链路则必须为空列表")
     channel: str = Field(default="finding", description="finding=完整路径支撑；observation=有疑点但路径不完整")
+    defect_kind: str = Field(
+        default="",
+        description=(
+            "缺陷种类，**必须从闭集取值**：unbounded_write / no_nul_termination / index_not_advanced / "
+            "unchecked_alloc / missing_release / double_free / use_after_free / null_deref / "
+            "integer_overflow / missing_error_check / race / path_trust / unsafe_macro / other。"
+            "同一语句上可能并存多个不同缺陷，该字段用于把它们彼此区分开；无法归类时选 other，"
+            "不要自造标签（自造标签会让同一语句上的同类缺陷无法被识别为同一主张）"
+        ),
+    )
+
+    # ---- 以下由流水线填写，不进入模型输出契约 ----
+    anchor: str = Field(default="", description="锚点 id：<file>:<行号>#<源文本指纹>", json_schema_extra=DETERMINISTIC)
+    anchor_fingerprint: str = Field(default="", description="所在语句源文本的指纹", json_schema_extra=DETERMINISTIC)
+    source_pass: str = Field(default="", description="产出来源批次：small/large/focused/tool", json_schema_extra=DETERMINISTIC)
+    source: str = Field(default="llm", description="llm / tool / merged", json_schema_extra=DETERMINISTIC)
+    merged_from: list[str] = Field(default_factory=list, description="被合并进来的原始 id", json_schema_extra=DETERMINISTIC)
+    evidence_status: str = Field(
+        default="",
+        description="位置校验结果：verified / unattributable / invalid（见 nodes/llm/review.py）",
+        json_schema_extra=DETERMINISTIC,
+    )
+    tool_evidence: list[str] = Field(
+        default_factory=list, description="外部工具（gcc -fanalyzer / cppcheck）的印证条目", json_schema_extra=DETERMINISTIC
+    )
 
 
 class RawFindings(BaseModel):
@@ -172,11 +215,54 @@ class Verdict(BaseModel):
     rebuttal_opinion: str = Field(description="反驳意见：一句话说明维持或推翻该 finding 的理由，三种结论均须给出")
     refutation_log: str = Field(description="反驳尝试记录：逐点核对结果")
     evidence_note: str = Field(default="", description="关键证据说明，file:line 形式")
-    contract_dependent: bool = Field(default=False, description="是否属于依赖跨模块契约的条目(展示时降级)")
+    contract_dependent: bool = Field(
+        default=False,
+        description=(
+            "是否依赖**本模块之外**不可见的契约（调用方加锁约定、外部长度约束等）。"
+            "为 true 表示本阶段无法独立核验：应由确定性闸门降级为 uncertain 并单列，"
+            "不作为 confirmed 计入精确率"
+        ),
+    )
+
+    # ---- 以下由流水线填写，不进入模型输出契约 ----
+    inconsistent: bool = Field(
+        default=False, description="同一主张出现互相冲突的结论，已交人工裁决", json_schema_extra=DETERMINISTIC
+    )
+    sibling_verdicts: list[dict] = Field(
+        default_factory=list, description="同主张上被保留的分歧结论原文", json_schema_extra=DETERMINISTIC
+    )
+    verdict_source: str = Field(
+        default="model", description="model=模型给出；fallback=模型漏回、由闸门降级补位", json_schema_extra=DETERMINISTIC
+    )
+    demoted_reason: str = Field(default="", description="被闸门降级的原因", json_schema_extra=DETERMINISTIC)
 
 
 class RebuttalReport(BaseModel):
     results: list[Verdict]
+
+
+class ToolEvidence(BaseModel):
+    """外部静态分析工具（gcc -fanalyzer / cppcheck）的独立发现。"""
+
+    tool: str = Field(description="gcc-analyzer / cppcheck")
+    file: str
+    line: int = 0
+    rule: str = Field(description="工具规则名，如 use-after-free / doubleFree / CWE-416")
+    severity: str = Field(description="映射到本项目等级：提示/一般/严重/致命")
+    message: str
+
+
+class ToolEvidenceReport(BaseModel):
+    """工具证据层产物。
+
+    **工具缺席不等于证伪**：实测 gcc -fanalyzer 与 cppcheck 合起来只能覆盖 18 项已知
+    缺陷中的 6 项，且最重要的 `buffer.c:7` 无界 strcpy 两个工具都抓不到。因此本产物
+    只能用于「印证」「补漏」「裁决矛盾」，绝不可用作「没有报告 ⇒ 不是缺陷」的依据。
+    """
+
+    available: list[str] = Field(default_factory=list, description="本次成功运行的工具")
+    skipped: list[str] = Field(default_factory=list, description="未能运行的工具及原因")
+    entries: list[ToolEvidence] = Field(default_factory=list)
 
 
 class ReviewMeta(BaseModel):
