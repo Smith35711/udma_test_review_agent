@@ -26,7 +26,7 @@ CONFIG_PATH_ENV = "MODEL_CONFIG"
 PROFILE_ENV = "LLM_PROFILE"
 SUPPORTED_TYPES = {"openai"}
 INHERITABLE_FIELDS = frozenset(
-    {"type", "base_url", "api_key", "temperature", "max_retries", "timeout", "extra_headers"}
+    {"type", "base_url", "api_key", "temperature", "seed", "max_retries", "timeout", "extra_headers"}
 )
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
@@ -145,6 +145,15 @@ class ModelSpec(BaseModel):
     api_key: str = ""
     provider: str = ""
     temperature: float = 0.7
+    seed: int | None = None
+    """采样种子。`None` = 不发送该参数（供应商自由采样）。
+
+    与 `temperature` 同为「条目级采样参数」，优先级也一样：调用方显式传入的
+    （`ReviewConfig.seed`）压过条目，条目没写则由 `llm.py` 决定不发。
+    它压低的只是采样随机性，**不承诺输出确定**——服务端实现与并发仍会引入差异，
+    故它只减少方差的一个来源，不能当作可复现性保证。
+    """
+
     max_retries: int = 2
     timeout: float = 60.0
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -180,6 +189,7 @@ class ProviderSpec(BaseModel):
     base_url: str = ""
     api_key: str = ""
     temperature: float | None = None
+    seed: int | None = None
     max_retries: int | None = None
     timeout: float | None = None
     extra_headers: dict[str, str] = Field(default_factory=dict)

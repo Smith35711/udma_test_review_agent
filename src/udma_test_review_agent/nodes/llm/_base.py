@@ -57,7 +57,7 @@ def _llm(prompt: str, schema: type, cfg: ReviewConfig, retries: int = 2, role: s
             cfg.first_token_timeout,
             cfg.chunk_timeout,
             "条目默认" if cfg.temperature is None else cfg.temperature,
-            cfg.seed if cfg.seed is not None else "未固定",
+            "条目默认" if cfg.seed is None else cfg.seed,
         )
         started = time.monotonic()
         try:

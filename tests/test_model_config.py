@@ -265,5 +265,76 @@ class OverviewTest(_ModelsTest):
         self.assertEqual(mc.ROLES, ("arch", "review", "rebuttal", "summary"))
 
 
+class SeedLayeringTest(_ModelsTest):
+    """`seed` 与 `temperature` 同为条目级采样参数，走同一套分层继承。
+
+    它此前**完全没有入口**：`ReviewConfig.seed` 一路传到 `llm.py` 的请求参数，
+    但 CLI 没有 `--seed`、models.yaml 也没有这个字段，于是真实运行里它恒为 None、
+    那几行代码永远不执行——「透传写完了却没接上」，与 P1 修的死配置同一类问题。
+    """
+
+    def test_seed_is_inherited_through_every_layer(self):
+        spec = self.load(
+            """
+active: m
+defaults:
+  type: openai
+  seed: 111
+providers:
+  p:
+    base_url: https://example.invalid/v1
+models:
+  - name: m
+    provider: p
+    model: mm
+"""
+        ).get("m")
+        self.assertEqual(spec.seed, 111)
+
+    def test_model_entry_overrides_provider_and_defaults(self):
+        spec = self.load(
+            """
+active: m
+defaults:
+  type: openai
+  seed: 111
+providers:
+  p:
+    base_url: https://example.invalid/v1
+    seed: 222
+models:
+  - name: m
+    provider: p
+    model: mm
+    seed: 333
+"""
+        ).get("m")
+        self.assertEqual(spec.seed, 333)
+
+    def test_seed_zero_is_a_real_value_not_an_empty_one(self):
+        """0 是合法种子。若按假值判空，`seed: 0` 会被静默丢掉、退回不发送——
+        而「不发送」意味着供应商自由采样，与「固定为 0」是相反的行为。"""
+        spec = self.load(
+            """
+active: m
+defaults:
+  type: openai
+  seed: 0
+providers:
+  p:
+    base_url: https://example.invalid/v1
+models:
+  - name: m
+    provider: p
+    model: mm
+"""
+        ).get("m")
+        self.assertEqual(spec.seed, 0)
+
+    def test_omitting_seed_leaves_it_unset(self):
+        spec = self.load(_BASE).get("cheap")
+        self.assertIsNone(spec.seed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -351,7 +351,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         f"- 被测项目：`{cfg.project_root}`",
         f"- 模块选择：{cfg.modules} ｜ 模块数 {len(order)} ｜ 并发上限 {cfg.max_parallel or '自动'}",
         f"- 模型配置：{cfg.model_profile or '(active)'} ｜ 采样温度 {cfg.temperature if cfg.temperature is not None else '条目默认'} ｜ "
-        f"种子 {cfg.seed if cfg.seed is not None else '未固定'}",
+        f"种子 {cfg.seed if cfg.seed is not None else '条目默认'}",
         f"- 阈值：小模块行数 {cfg.small_module_line_threshold} ｜ 单次上限 {cfg.max_findings_per_pass} ｜ "
         f"确认置信度 {cfg.confirmed_confidence_threshold}",
         f"- 输入指纹：`{run_manifest.digest if run_manifest else '不可用'}`"

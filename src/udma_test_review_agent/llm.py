@@ -200,6 +200,30 @@ def _distribution_bar(reasoning_len: int, content_len: int, width: int = BAR_WID
     return "█" * reasoning_blocks + "░" * (width - reasoning_blocks)
 
 
+def _sampling_params(
+    spec: ModelSpec, temperature: float | None, seed: int | None
+) -> dict[str, object]:
+    """组装请求的采样参数，逐字段按「显式入参 > 模型条目」取值。
+
+    采样参数此前被完全忽略：配置里的 temperature 只走 `create_llm` 那条 langchain 路径，
+    而生产节点全部走流式路径，等于实际使用供应商默认值——配置写了不生效。
+
+    两个字段的**取值方向一致**（`None` = 该层未指定，向下取条目），但落到请求上的
+    表现不同：temperature 总有值（条目有默认 0.7），seed 则可能在两层都未指定，
+    此时**不发送该参数**，而不是发一个 0——0 是一个合法的种子，与「不固定」不是一回事。
+    抽成独立函数是为了让这层优先级可被直接断言，而不必真的发一次请求。
+    """
+    params: dict[str, object] = {
+        "temperature": spec.temperature if temperature is None else temperature
+    }
+    effective_seed = spec.seed if seed is None else seed
+    if effective_seed is not None:
+        # seed 只降低采样随机性，不保证输出确定（服务端实现与并发都可能引入差异），
+        # 因此它是「方差的一个来源」而非「可复现性保证」。
+        params["seed"] = effective_seed
+    return params
+
+
 def stream_llm_once(
     prompt: str,
     schema: type[BaseModel] | None = None,
@@ -224,7 +248,8 @@ def stream_llm_once(
     (思维链, 正文) 二元组）；
     schema 为 Pydantic 模型时启用 JSON 结构化输出，返回校验后的实例。
     profile 指定模型配置中的 name；为空时依 LLM_PROFILE 环境变量或配置 active。
-    temperature 为 None 时取模型条目的 temperature；seed 为 None 时不发送该参数。
+    temperature / seed 为 None 时取模型条目的同名字段（见 `_sampling_params`）；
+    两者都为 None 的 seed 不发送该参数——不发 ≠ 发 0。
     role 只用于**过程统计的分组**（模型路由由调用方解析后经 profile 传入），
     使「哪个阶段花了多少 token」可回答。
 
@@ -337,11 +362,7 @@ def _stream_once(
     events: queue.Queue[tuple[str, object]] = queue.Queue()
     # 采样参数此前被完全忽略：配置里的 temperature 只走 create_llm 那条 langchain 路径，
     # 而生产节点全部走本函数，等于实际使用供应商默认值。显式透传后配置才真正生效。
-    sampling: dict[str, object] = {"temperature": spec.temperature if temperature is None else temperature}
-    if seed is not None:
-        # seed 只降低采样随机性，不保证输出确定（服务端实现与并发都可能引入差异），
-        # 因此它是「方差的一个来源」而非「可复现性保证」。
-        sampling["seed"] = seed
+    sampling = _sampling_params(spec, temperature, seed)
 
     def _worker() -> None:
         try:

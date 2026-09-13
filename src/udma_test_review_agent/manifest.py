@@ -86,6 +86,7 @@ def _model_digest(cfg: ReviewConfig) -> str:
         spec.base_url,
         str(spec.temperature),
         str(cfg.temperature),
+        str(spec.seed),
         str(cfg.seed),
         "|".join(f"{role}={target}" for role, target in sorted(roles.items())),
     )
