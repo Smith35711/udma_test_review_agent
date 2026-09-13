@@ -225,6 +225,26 @@ class Finding(BaseModel):
     )
 
 
+class ReviewFunnel(BaseModel):
+    """检视阶段的条目漏斗：每一步过滤掉多少条。
+
+    设计文档 P6 要求「过滤率纳入报告，作为评审结论可信度依据」，而在这之前**漏斗根本
+    不存在**——只知道最终留下几条，不知道中间丢了多少、为什么丢。过滤率异常（例如
+    去重砍掉一大半）是提示词或上下文注入出问题的信号，没有漏斗就只能看见结果看不见过程。
+    """
+
+    model_findings: int = Field(default=0, description="各批次声称 channel=finding 的原始条数之和")
+    model_observations: int = Field(default=0, description="各批次 observation 条数之和")
+    location_invalid: int = Field(default=0, description="位置校验未通过、降级为 observation")
+    tool_added: int = Field(default=0, description="工具补漏新增的候选")
+    tool_rejected: int = Field(default=0, description="工具候选因位置校验未通过被丢弃")
+    after_dedup: int = Field(default=0, description="锚点+缺陷种类去重后的条数")
+    capped: int = Field(default=0, description="超出单次上限被丢弃")
+    obs_redundant: int = Field(default=0, description="与已保留主张重复或自身重复而剔除的 observation")
+    kept_findings: int = Field(default=0, description="最终 findings")
+    kept_observations: int = Field(default=0, description="最终 observations")
+
+
 class RawFindings(BaseModel):
     findings: list[Finding]
     observations: list[Finding] = Field(default_factory=list)
@@ -235,6 +255,12 @@ class RawFindings(BaseModel):
             "由 `nodes/llm/review.py` 确定性计算后回填，**不由模型产出**——"
             "它是「上游已知线索在下游丢失」这一漏检模式的显式记账，用于让漏检可见。"
         ),
+        json_schema_extra=DETERMINISTIC,
+    )
+    funnel: ReviewFunnel = Field(
+        default_factory=ReviewFunnel,
+        description="检视阶段的条目漏斗，由 `nodes/llm/review.py` 确定性回填，不由模型产出",
+        json_schema_extra=DETERMINISTIC,
     )
 
 

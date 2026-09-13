@@ -37,7 +37,7 @@ def critical_paths_node(state: ReviewState) -> dict[str, Any]:
         global_arch=json.dumps(state["global_arch"], ensure_ascii=False),
         module_archs=json.dumps(archs, ensure_ascii=False),
     )
-    report = _llm(prompt, CriticalPathReport, cfg)
+    report = _llm(prompt, CriticalPathReport, cfg, role="arch")
     data = report.model_dump()
     _write_json(persisted, data)
     logger.info("[S3] 关键路径完成: %d 条", len(report.paths))

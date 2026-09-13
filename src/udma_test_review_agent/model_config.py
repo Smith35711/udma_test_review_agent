@@ -31,6 +31,19 @@ INHERITABLE_FIELDS = frozenset(
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
+ROLES = ("arch", "review", "rebuttal", "summary")
+"""可路由的节点角色。
+
+- `arch`：全局架构、模块架构、关键路径（归纳类，长输入的粗活）
+- `review`：模块检视（效果的决定性环节）
+- `rebuttal`：反驳（独立证伪，需要与检视不同的视角）
+- `summary`：模块执行摘要（纯文字加工，最廉价的一环）
+
+**角色名是闭集并会被校验**：写错一个字母（`reviews`）若被静默接受，路由会一声不响地
+不生效，而用户以为自己已经换过模型了——这类「配置写了没反应」正是本工程着力消除的
+失败模式。未配置的角色回退到默认解析链（`--model` > `LLM_PROFILE` > `active`）。
+"""
+
 
 _OPENCODE_CONFIG_DEFAULT = Path.home() / ".config" / "opencode" / "opencode.json"
 """opencode 全局配置的默认路径，作为密钥的最后一级回退来源。"""
@@ -184,6 +197,10 @@ class ModelsConfig(BaseModel):
 
     active: str = ""
     models: list[ModelSpec]
+    roles: dict[str, str] = Field(
+        default_factory=dict,
+        description=f"节点角色 -> 模型 name 的路由表；可选角色见 {ROLES}。未配置的角色回退默认解析链",
+    )
 
     @model_validator(mode="after")
     def _check(self) -> ModelsConfig:
@@ -197,6 +214,15 @@ class ModelsConfig(BaseModel):
             self.active = names[0]
         if self.active not in names:
             raise ValueError(f"active 指向不存在的模型: {self.active}，可选: {names}")
+        unknown_roles = sorted(set(self.roles) - set(ROLES))
+        if unknown_roles:
+            raise ValueError(
+                f"roles 含未知角色: {unknown_roles}，可选: {list(ROLES)}"
+                "（角色名写错若不报错，路由会静默失效）"
+            )
+        bad_targets = sorted({v for v in self.roles.values() if v not in names})
+        if bad_targets:
+            raise ValueError(f"roles 指向不存在的模型: {bad_targets}，可选: {names}")
         return self
 
     def get(self, name: str) -> ModelSpec:
@@ -336,9 +362,48 @@ def _merge_entries(data: dict[str, Any], config_path: Path) -> dict[str, Any]:
     return result
 
 
+_CONFIG_CACHE: dict[str, tuple[tuple[int, int], ModelsConfig]] = {}
+_CONFIG_CACHE_MAX = 8
+"""`load_models_config` 的结果缓存，键为路径、失效依据为 `(mtime_ns, size)`。
+
+`resolve_model` 会被**每一次 LLM 调用**调用一次（`stream_llm_once` 开头），每次都要
+读 YAML、跑两级合并与校验；加上角色路由后还会再多一次。运行期配置是不变的，
+这些重复解析纯属浪费。用文件时间戳做失效依据，改配置仍会立即生效。
+
+**缓存对象按只读对待**：多个调用方共享同一实例，改写它会污染后续调用。
+"""
+
+
+def reset_config_cache() -> None:
+    """清空模型配置缓存。供测试在改写配置文件/环境变量后强制重新解析。"""
+    _CONFIG_CACHE.clear()
+
+
 def load_models_config(path: str | os.PathLike[str] | None = None) -> ModelsConfig:
-    """加载并校验模型配置文件；defaults / providers 在返回前已合并进各条目。"""
+    """加载并校验模型配置文件；defaults / providers 在返回前已合并进各条目。
+
+    结果按文件时间戳缓存（见 `_CONFIG_CACHE`），返回的对象按只读对待。
+    """
     config_path = _config_path(path)
+    key = str(config_path)
+    try:
+        stat = config_path.stat()
+        stamp: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None:
+        cached = _CONFIG_CACHE.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+    config = _load_models_config(config_path)
+    if stamp is not None:
+        if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX:
+            _CONFIG_CACHE.pop(next(iter(_CONFIG_CACHE)))
+        _CONFIG_CACHE[key] = (stamp, config)
+    return config
+
+
+def _load_models_config(config_path: Path) -> ModelsConfig:
     if not config_path.is_file():
         raise ModelConfigError(
             f"模型配置文件不存在: {config_path}（可用环境变量 {CONFIG_PATH_ENV} 指定）"
@@ -398,6 +463,22 @@ def resolve_model(
     return spec
 
 
+def resolve_role(
+    role: str,
+    path: str | os.PathLike[str] | None = None,
+) -> str:
+    """取角色对应的模型 name；未配置该角色时返回空串。
+
+    **返回空串而不是回退到 active**：调用方需要区分「该角色被显式指定了模型」与
+    「没配，走默认链」。前者要压过 `LLM_PROFILE` 环境变量（那是全局默认，不该
+    无声地作废整套路由），后者必须让位给它。把回退做在这里就丢掉了这个区别。
+    """
+    if not role:
+        return ""
+    config = load_models_config(path)
+    return config.roles.get(role, "")
+
+
 class ModelSummary(BaseModel):
     """单个模型的展示摘要：供 CLI 与 Web 展示，不含密钥本体。"""
 
@@ -411,13 +492,14 @@ class ModelSummary(BaseModel):
 
 
 class ModelsOverview(BaseModel):
-    """模型配置总览：路径、配置 active、本次生效项及其来源、条目列表。"""
+    """模型配置总览：路径、配置 active、本次生效项及其来源、条目列表、角色路由。"""
 
     path: str
     active: str
     effective: str
     source: str
     items: list[ModelSummary]
+    roles: dict[str, str] = Field(default_factory=dict, description="角色 -> 模型 name；未配置的角色不在表中")
 
 
 def describe_models(
@@ -445,12 +527,13 @@ def describe_models(
         for spec in config.models
     ]
     logger.debug(
-        "[模型配置] 总览 path=%s active=%s effective=%s 来源=%s 模型数=%d",
+        "[模型配置] 总览 path=%s active=%s effective=%s 来源=%s 模型数=%d 角色=%s",
         config_path,
         config.active,
         effective,
         source,
         len(items),
+        config.roles,
     )
     return ModelsOverview(
         path=str(config_path),
@@ -458,6 +541,7 @@ def describe_models(
         effective=effective,
         source=source,
         items=items,
+        roles=dict(config.roles),
     )
 
 

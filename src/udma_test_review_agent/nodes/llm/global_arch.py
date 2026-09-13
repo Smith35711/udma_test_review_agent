@@ -106,7 +106,7 @@ def global_arch_node(state: ReviewState) -> dict[str, Any]:
         len(prompt),
         persisted,
     )
-    arch, counts = _ground_entries(scan, _llm(prompt, GlobalArchitecture, cfg))
+    arch, counts = _ground_entries(scan, _llm(prompt, GlobalArchitecture, cfg, role="arch"))
     _write_json(persisted, arch.model_dump())
     logger.info(
         "[S1] 全局架构完成: 模块=%d 信任面=%d 并发热点=%d ｜ 已核实=%d 推测=%d 丢弃=%d",

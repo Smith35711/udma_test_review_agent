@@ -91,7 +91,7 @@ def _batch_rebut(scan: ScanResult, findings: list[Finding], cfg, module_arch: st
     valid_ids = {finding.id for finding in findings}
     prompt = REBUTTAL_BATCH_PROMPT.format(findings="\n\n".join(blocks), module_arch=module_arch)
     logger.debug("[反驳] 批量请求 findings=%d prompt_chars=%d", len(findings), len(prompt))
-    report = _llm(prompt, RebuttalReport, cfg)
+    report = _llm(prompt, RebuttalReport, cfg, role="rebuttal")
     verdicts: dict[str, Verdict] = {}
     for verdict in report.results:
         if verdict.id in valid_ids and verdict.id not in verdicts:

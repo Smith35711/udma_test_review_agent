@@ -21,6 +21,13 @@
 #   timeout        请求超时秒数，默认 60（用于 create_llm）
 #   extra_headers  附加请求头（可选）；与下层按「键」合并，本层同名键优先
 #
+# roles                 可选的节点角色路由表：角色 -> 模型 name（**不是 provider 名**）。
+#                       可写角色：arch（架构归纳）、review（模块检视）、rebuttal（反驳）、
+#                       summary（模块摘要）。写错角色名或指向不存在的模型会直接报错，
+#                       不会静默失效。优先级：--model > roles > LLM_PROFILE > active。
+#                       未列出的角色走默认解析链；整块省略时行为与从前完全一致。
+#                       改这里会改变运行清单里的模型指纹，故已产出的断点会整体失效重算。
+#
 # 空值（如 `timeout:`）视为「未填写」，沿用下层取值；extra_headers 按键浅合并，
 # 其余字段整体覆盖。合并后的最终取值可用 `.venv/bin/python scripts/run_review.py --list-models` 查看。
 #
@@ -31,6 +38,13 @@
 #        未声明 providers / defaults 块的旧配置文件行为完全不变。
 
 active: deepseek-v4.1-flash
+
+# 角色路由示例（默认全部注释掉，即所有阶段都用生效模型）：
+# roles:
+#   review: deepseek-reasoner     # 检视是效果的决定性环节，值得用强模型
+#   rebuttal: deepseek-reasoner   # 反驳需要与检视不同的视角
+#   summary: deepseek-chat        # 纯文字加工，用便宜的
+roles: {}
 
 defaults:
   type: openai

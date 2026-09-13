@@ -248,6 +248,9 @@ def _review_check_one(cfg: ReviewConfig, state: ReviewState, module: str) -> dic
     # 漏检记账随产物往下走：检视阶段算出的「已定位检查项无回应」清单必须进最终产物，
     # 否则它只停在日志里，人工读报告时看不到——而这正是最需要被看到的一类问题。
     payload["checklist_gaps"] = list(raw.checklist_gaps)
+    # 过程指标随产物往下走，理由同 checklist_gaps：它必须在最终产物里，否则总报告
+    # 只能读到一个结果，读不到「中间过滤掉多少、为什么过滤」。
+    payload["funnel"] = raw.funnel.model_dump()
     if missing:
         # 整批反驳调用失败时，全部条目会落到这里：此时 confirmed=0/uncertain=N 看起来「健康」，
         # 必须让它在日志与统计里显形，否则失败被伪装成正常结果。

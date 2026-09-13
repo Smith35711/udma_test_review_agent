@@ -20,6 +20,7 @@ from ...schemas import (
     ModuleArchitecture,
     RawFindings,
     ReviewCheck,
+    ReviewFunnel,
     ScanResult,
 )
 from ...state import ReviewState
@@ -101,7 +102,7 @@ def _module_flagged(scan: ScanResult, global_arch: GlobalArchitecture, module: s
 
 def _review_pass(prompt: str, cfg: ReviewConfig, pass_name: str) -> RawFindings:
     logger.debug("[检视] 发起检视 pass=%s prompt_chars=%d", pass_name, len(prompt))
-    result = _llm(prompt, RawFindings, cfg)
+    result = _llm(prompt, RawFindings, cfg, role="review")
     for finding in result.findings:
         finding.source_pass = pass_name
     for observation in result.observations:
@@ -126,7 +127,7 @@ def _content_review(module: str, raw: RawFindings, cfg: ReviewConfig) -> ReviewC
         len(raw.observations),
         len(prompt),
     )
-    return _llm(prompt, ReviewCheck, cfg)
+    return _llm(prompt, ReviewCheck, cfg, role="review")
 
 
 def _small_review(prompt: str, module: str, cfg: ReviewConfig) -> RawFindings:
@@ -352,6 +353,11 @@ def _review_module_raw(
 
     merged, observations, invalid = _enrich_and_split(scan, raw_batches)
     total_raw = len(merged) + len(invalid)
+    funnel = ReviewFunnel(
+        model_findings=total_raw,
+        model_observations=len(observations) - len(invalid),
+        location_invalid=len(invalid),
+    )
 
     # 补漏：工具独立报出、模型完全没提的位置补为候选 finding。这是纯增益的召回提升，
     # 依据是「工具报告 = 该位置确实有问题」；反之（工具没报）绝不作任何推断。
@@ -373,15 +379,18 @@ def _review_module_raw(
                 [f"{f.file}:{f.line} {f.defect_kind}" for f in candidates],
             )
             merged.extend(candidates)
+        funnel.tool_added = len(candidates)
 
     # 去重：同一锚点 + 同一缺陷种类算同一主张。按行号归并会丢掉同一语句上的不同缺陷
     # （实测 parser.c:13 上并存三个都成立的缺陷），故只在主张级别合并。
     deduped = [Finding.model_validate(d) for d in fu.dedup_claims([f.model_dump() for f in merged])]
+    funnel.after_dedup = len(deduped)
     # **先按严重度排序再截断**：原来按批次插入顺序截断，大模块里第三条批次里的致命缺陷
     # 会被第一批次的提示挤掉，且被丢的是哪条只留在调试日志里。
     deduped.sort(key=lambda f: (fu.severity_rank(f.severity), f.file, f.line))
     final_findings = deduped[: cfg.max_findings_per_pass]
     truncated = deduped[len(final_findings):]
+    funnel.capped = len(truncated)
     for idx, finding in enumerate(final_findings, 1):
         finding.id = f"f{idx}"
     if truncated:
@@ -410,6 +419,9 @@ def _review_module_raw(
     kept_observations.sort(key=lambda o: (fu.severity_rank(o.severity), o.file, o.line))
     for idx, observation in enumerate(kept_observations, 1):
         observation.id = f"o{idx}"
+    funnel.obs_redundant = redundant
+    funnel.kept_findings = len(final_findings)
+    funnel.kept_observations = len(kept_observations)
 
     logger.debug(
         "[检视] %s 合并去重 原始=%d 去重后=%d 上限=%d obs原始=%d obs保留=%d(剔除冗余%d) 位置无效降级=%d",
@@ -434,7 +446,10 @@ def _review_module_raw(
     if gaps:
         logger.warning("[检视] %s 以下已定位检查项本轮无任何回应（可能漏检）: %s", module, gaps)
     return RawFindings(
-        findings=final_findings, observations=kept_observations, checklist_gaps=gaps
+        findings=final_findings,
+        observations=kept_observations,
+        checklist_gaps=gaps,
+        funnel=funnel,
     ).model_dump()
 
 

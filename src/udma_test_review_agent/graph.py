@@ -25,6 +25,7 @@ from .nodes.tool.scan import scan_node
 from .nodes.tool.size_analysis import size_analysis_node
 from .nodes.tool.tool_evidence import tool_evidence_node
 from .state import ReviewState
+from .stats import timed_stage
 
 logger = get_logger(__name__)
 
@@ -35,19 +36,21 @@ def _should_continue(state: ReviewState) -> str:
 
 
 builder = StateGraph(ReviewState)
-builder.add_node("scan", scan_node)
-builder.add_node("tool_evidence", tool_evidence_node)
-builder.add_node("global_arch", global_arch_node)
-builder.add_node("module_archs", module_archs_node)
-builder.add_node("critical_paths", critical_paths_node)
-builder.add_node("merge", merge_node)
-builder.add_node("size_analysis", size_analysis_node)
-builder.add_node("review_module", review_module_node)
-builder.add_node("rebuttal_module", rebuttal_module_node)
-builder.add_node("review_check", review_check_node)
-builder.add_node("module_report", module_report_node)
-builder.add_node("advance", advance_node)
-builder.add_node("report", report_node)
+# 节点统一在此处包一层耗时统计：让每个节点自己计时会把「阶段耗时分布」（设计文档 P6
+# 要求进报告）变成十几份格式各异的局部日志，汇总不起来。包装只加计时，不加语义。
+builder.add_node("scan", timed_stage("scan", scan_node))
+builder.add_node("tool_evidence", timed_stage("tool_evidence", tool_evidence_node))
+builder.add_node("global_arch", timed_stage("global_arch", global_arch_node))
+builder.add_node("module_archs", timed_stage("module_archs", module_archs_node))
+builder.add_node("critical_paths", timed_stage("critical_paths", critical_paths_node))
+builder.add_node("merge", timed_stage("merge", merge_node))
+builder.add_node("size_analysis", timed_stage("size_analysis", size_analysis_node))
+builder.add_node("review_module", timed_stage("review_module", review_module_node))
+builder.add_node("rebuttal_module", timed_stage("rebuttal_module", rebuttal_module_node))
+builder.add_node("review_check", timed_stage("review_check", review_check_node))
+builder.add_node("module_report", timed_stage("module_report", module_report_node))
+builder.add_node("advance", timed_stage("advance", advance_node))
+builder.add_node("report", timed_stage("report", report_node))
 
 builder.add_edge(START, "scan")
 builder.add_edge("scan", "tool_evidence")

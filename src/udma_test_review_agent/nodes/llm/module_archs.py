@@ -88,7 +88,7 @@ def module_archs_node(state: ReviewState) -> dict[str, Any]:
             len(prompt),
             arch_path,
         )
-        arch, fixed = _ground_checklist(scan, _llm(prompt, ModuleArchitecture, cfg))
+        arch, fixed = _ground_checklist(scan, _llm(prompt, ModuleArchitecture, cfg, role="arch"))
         _write_json(arch_path, arch.model_dump())
         archs[module] = arch.model_dump()
         located = sum(1 for c in arch.checklist if c.file and c.line)

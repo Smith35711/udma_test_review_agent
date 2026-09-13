@@ -250,7 +250,7 @@ def _module_report_one(cfg: ReviewConfig, state: ReviewState, module: str) -> di
     try:
         # 走 `_llm` 而非直接调 `stream_llm_once`：摘要同样需要重试与超时封装，
         # 且 `_llm` 是「LLM 唯一出口」这一定位在节点侧的落点（schema=None 即纯文本）。
-        summary = _llm(REPORT_SUMMARY_PROMPT.format(report=_truncate(body, 8000)), None, cfg)
+        summary = _llm(REPORT_SUMMARY_PROMPT.format(report=_truncate(body, 8000)), None, cfg, role="summary")
         logger.debug("[模块报告] %s 摘要字符=%d", module, len(summary))
     except Exception as exc:  # noqa: BLE001 - 摘要失败不阻塞报告落盘
         logger.warning("[模块报告] %s 摘要生成失败: %s", module, exc)

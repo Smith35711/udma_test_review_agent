@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 import uuid
-from typing import Sequence
+from typing import Any, Sequence
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from .log import get_logger
 # load_deepseek_config 一并转出，保持 `llm.load_deepseek_config` 的既有可达性
 from .model_config import ModelSpec, load_deepseek_config, resolve_api_key, resolve_model
+from .stats import LlmCall, get_stats
 
 logger = get_logger(__name__)
 
@@ -211,6 +212,7 @@ def stream_llm_once(
     include_reasoning: bool = False,
     temperature: float | None = None,
     seed: int | None = None,
+    role: str = "",
 ) -> str | tuple[str, str] | BaseModel:
     """唯一 LLM 对外接口：内部流式接收，外部一次性返回。
 
@@ -223,6 +225,85 @@ def stream_llm_once(
     schema 为 Pydantic 模型时启用 JSON 结构化输出，返回校验后的实例。
     profile 指定模型配置中的 name；为空时依 LLM_PROFILE 环境变量或配置 active。
     temperature 为 None 时取模型条目的 temperature；seed 为 None 时不发送该参数。
+    role 只用于**过程统计的分组**（模型路由由调用方解析后经 profile 传入），
+    使「哪个阶段花了多少 token」可回答。
+
+    本函数是记账外壳：真正的流式实现在 `_stream_once`。拆开是因为失败也必须记账，
+    而失败路径（超时、schema 校验不过）恰恰发生在实现内部深处——把 try 放在
+    实现外面，meta 里已经填好的 token 用量才不会随异常一起丢掉。
+    """
+    meta: dict[str, Any] = {}
+    started = time.monotonic()
+    try:
+        result = _stream_once(
+            prompt,
+            schema,
+            meta,
+            profile=profile,
+            model=model,
+            base_url=base_url,
+            first_token_timeout=first_token_timeout,
+            chunk_timeout=chunk_timeout,
+            include_reasoning=include_reasoning,
+            temperature=temperature,
+            seed=seed,
+        )
+    except BaseException as exc:  # noqa: BLE001 - 记账后原样抛出，不改变调用方语义
+        _record_call(role, schema, meta, started, exc)
+        raise
+    _record_call(role, schema, meta, started, None)
+    return result
+
+
+def _record_call(
+    role: str,
+    schema: type[BaseModel] | None,
+    meta: dict[str, Any],
+    started: float,
+    exc: BaseException | None,
+) -> None:
+    """把一次调用的过程数据记进运行统计。**本函数不抛异常**：统计是旁路。"""
+    try:
+        get_stats().record_llm(
+            LlmCall(
+                role=role,
+                spec=str(meta.get("spec", "")),
+                model=str(meta.get("model", "")),
+                schema=getattr(schema, "__name__", "") or "",
+                ok=exc is None,
+                elapsed=time.monotonic() - started,
+                prompt_chars=int(meta.get("prompt_chars", 0) or 0),
+                reasoning_chars=int(meta.get("reasoning_chars", 0) or 0),
+                content_chars=int(meta.get("content_chars", 0) or 0),
+                prompt_tokens=int(meta.get("prompt_tokens", 0) or 0),
+                completion_tokens=int(meta.get("completion_tokens", 0) or 0),
+                total_tokens=int(meta.get("total_tokens", 0) or 0),
+                has_usage=bool(meta.get("has_usage")),
+                error="" if exc is None else f"{type(exc).__name__}: {exc}",
+            )
+        )
+    except Exception as stats_exc:  # noqa: BLE001
+        logger.debug("[统计] 记账失败（不影响本次调用）: %s", stats_exc)
+
+
+def _stream_once(
+    prompt: str,
+    schema: type[BaseModel] | None,
+    meta: dict[str, Any],
+    *,
+    profile: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    first_token_timeout: float = LLM_FIRST_TOKEN_TIMEOUT,
+    chunk_timeout: float = LLM_CHUNK_TIMEOUT,
+    include_reasoning: bool = False,
+    temperature: float | None = None,
+    seed: int | None = None,
+) -> str | tuple[str, str] | BaseModel:
+    """流式接收的实现本体；过程数据写进入参 `meta`（就地填充，不返回值）。
+
+    `meta` 用出参而非返回值，是为了让「流式已结束、schema 校验失败」的调用也能
+    留下 token 用量：那种情况会抛异常，但用量已经产生。
     """
     spec = resolve_model(profile)
     model = model or spec.model
@@ -363,6 +444,21 @@ def stream_llm_once(
     elapsed = time.monotonic() - start
     total = len(reasoning_text) + len(text)
     reasoning_pct = round(len(reasoning_text) * 100 / total) if total else 0
+    # 过程数据先落 meta，再走 schema 校验：校验失败会抛异常触发重试，而那一次调用
+    # 消耗的 token 是实实在在花掉的，不该因为「这一版 JSON 不合法」就不记账。
+    meta.update(
+        {
+            "spec": spec.name,
+            "model": model,
+            "prompt_chars": len(prompt),
+            "reasoning_chars": len(reasoning_text),
+            "content_chars": len(text),
+            "has_usage": usage is not None,
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        }
+    )
     if usage is not None:
         logger.info(
             "[完成] 总耗时 %.3fs [%s] 思维链=%d字(%d%%) 正文=%d字(%d%%) 输出摘要=%r "

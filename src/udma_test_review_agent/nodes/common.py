@@ -209,6 +209,16 @@ def _critical_paths_path(cfg: ReviewConfig) -> Path:
     return _output_dir(cfg) / "critical_paths.json"
 
 
+def _project_findings_path(cfg: ReviewConfig) -> Path:
+    """项目级机器可读产物：供 CI 消费、后续基线与抑制使用。"""
+    return _output_dir(cfg) / "findings.json"
+
+
+def _metrics_path(cfg: ReviewConfig) -> Path:
+    """过程指标产物：token 用量、各阶段耗时、过滤率（设计文档 P6）。"""
+    return _output_dir(cfg) / "metrics.json"
+
+
 def _module_dir(cfg: ReviewConfig, module: str) -> Path:
     return _output_dir(cfg, module)
 

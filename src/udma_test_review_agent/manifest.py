@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .configuration import ReviewConfig
 from .log import get_logger
-from .model_config import resolve_model
+from .model_config import load_models_config, resolve_model
 from .module_map import _config_path as modules_config_path
 from .schemas import FINGERPRINT_FIELDS, RunManifest
 from .tools.executors.c_scanner import C_SUFFIXES
@@ -70,9 +70,14 @@ def _prompts_digest() -> str:
 
 
 def _model_digest(cfg: ReviewConfig) -> str:
-    """生效模型的关键属性。密钥不参与——换密钥不影响结论，也不该写进产物。"""
+    """生效模型的关键属性 + 角色路由表。密钥不参与——换密钥不影响结论，也不该写进产物。
+
+    角色路由必须进来：它是「哪个阶段用哪个模型」的一部分，改了它却不失效断点，
+    就会拿按旧路由产出的架构去配按新路由产出的检视，结论来源混成两套。
+    """
     try:
         spec = resolve_model(cfg.model_profile or None)
+        roles = load_models_config().roles
     except ValueError:
         return "unresolved"
     return _digest(
@@ -82,6 +87,7 @@ def _model_digest(cfg: ReviewConfig) -> str:
         str(spec.temperature),
         str(cfg.temperature),
         str(cfg.seed),
+        "|".join(f"{role}={target}" for role, target in sorted(roles.items())),
     )
 
 
@@ -150,7 +156,7 @@ def describe_changes(old: RunManifest | None, new: RunManifest) -> list[str]:
         if name == "sources" or name == "sources_digest":
             changed.append(f"源码内容变化（{_source_change_brief(old, new)}）")
         elif name == "model_digest":
-            changed.append("生效模型或采样参数变化")
+            changed.append("生效模型、采样参数或角色路由变化")
         elif name == "prompts_digest":
             changed.append("提示词变化")
         elif name == "artifact_version":

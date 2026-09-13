@@ -3,6 +3,11 @@
 用法:
   agent/.venv/bin/python agent/scripts/run_review.py --project /path/to/c_project [--modules all|M01|M01,M03|M01-M05] [--log-level LEVEL]
   agent/.venv/bin/python agent/scripts/run_review.py --list-models
+
+退出码:
+  0  评审完成，且未触发 --fail-on 门槛
+  1  有模块评审失败（结果不完整）
+  2  评审完成，但检出的已确认问题达到 --fail-on 门槛（供构建门禁使用）
 """
 
 from __future__ import annotations
@@ -17,18 +22,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from dataclasses import asdict
 
+from udma_test_review_agent import findings_util as fu
 from udma_test_review_agent.configuration import ReviewConfig
 from udma_test_review_agent.graph import graph
 from udma_test_review_agent.log import get_logger, set_log_level
-from udma_test_review_agent.model_config import describe_models
-from udma_test_review_agent.nodes.common import _AUTO_PARALLEL
+from udma_test_review_agent.model_config import ROLES, describe_models
+from udma_test_review_agent.nodes.common import _AUTO_PARALLEL, _metrics_path, _project_findings_path
+from udma_test_review_agent.stats import get_stats, reset_stats
 from udma_test_review_agent.versioning import prepare_run
 
 logger = get_logger(__name__)
 
+FAIL_ON_RANK = {"严重": fu.severity_rank("严重"), "致命": fu.severity_rank("致命")}
+"""`--fail-on` 可选项 -> 触发的严重度门槛（rank 越小越严重，命中条件是 <=）。"""
+
+EXIT_MODULE_FAILURE = 1
+EXIT_SEVERITY_THRESHOLD = 2
+
 
 def _print_models(profile: str | None) -> int:
-    """打印可选模型表；返回进程退出码（0 成功，1 配置错误）。"""
+    """打印可选模型表与角色路由；返回进程退出码（0 成功，1 配置错误）。"""
     try:
         overview = describe_models(profile=profile)
     except ValueError as exc:  # ModelConfigError 继承 ValueError
@@ -55,9 +68,15 @@ def _print_models(profile: str | None) -> int:
             f"{mark:<6}  {'已配置' if item.has_api_key else '未配置'}"
         )
     print()
+    print("角色路由（config/models.yaml 的 roles 块；未列出的角色走生效模型）:")
+    for role in ROLES:
+        target = overview.roles.get(role)
+        print(f"  {role:<9} -> {target or '(未配置)'}")
+    print()
     print(
         f"共 {len(overview.items)} 个模型；用 --model NAME 或环境变量 LLM_PROFILE 切换"
-        "（填模型 name，不是 provider 名）。ACTIVE 列 * 为本次生效，- 为配置 active 但被覆盖。"
+        "（填模型 name，不是 provider 名）。ACTIVE 列 * 为本次生效，- 为配置 active 但被覆盖。\n"
+        "优先级：--model（压过一切）> roles 角色路由 > LLM_PROFILE > active。"
     )
     return 1 if unknown else 0
 
@@ -88,6 +107,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--clean", action="store_true", help="清产物重跑：先归档三阶段产物再全量重算")
+    parser.add_argument(
+        "--fail-on",
+        choices=["none", *FAIL_ON_RANK],
+        default="none",
+        help=(
+            "检出达到该等级的**已确认**问题时以退出码 2 结束，供构建门禁使用："
+            "none=只看模块失败（默认，与既有行为一致）｜严重｜致命。"
+            "只统计 confirmed——uncertain 是需要人看的，不该让构建失败"
+        ),
+    )
     parser.add_argument(
         "--list-models",
         action="store_true",
@@ -136,23 +165,79 @@ def main() -> None:
             _AUTO_PARALLEL,
         )
     prepare_run(config.output_root, clean=args.clean)
+    reset_stats()  # 过程统计是进程级单例；同进程内重复 invoke（测试/长驻）必须清零
     result = graph.invoke({"config": asdict(config)})
     failed = dict(result.get("module_failures") or {})
     logger.info("评审结束: report=%s 失败模块=%d", result.get("report_path"), len(failed))
-    print(
-        json.dumps(
-            {
-                "report_path": result.get("report_path"),
-                "max_parallel": config.max_parallel,
-                "failed_modules": failed,
-            },
-            ensure_ascii=False,
-        )
-    )
+
+    summary = _run_summary(config, result, failed, args.fail_on)
+    print(json.dumps(summary, ensure_ascii=False))
     if failed:
         for module, reason in sorted(failed.items()):
             print(f"模块 {module} 评审失败: {reason}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(EXIT_MODULE_FAILURE)
+    if summary["exit_code"] == EXIT_SEVERITY_THRESHOLD:
+        print(
+            f"检出已确认的最高严重等级为 {summary['worst_confirmed_severity']}，"
+            f"达到 --fail-on {args.fail_on} 门槛",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_SEVERITY_THRESHOLD)
+
+
+def _run_summary(
+    config: ReviewConfig, result: dict, failed: dict[str, str], fail_on: str
+) -> dict:
+    """组装 stdout 的机器可读摘要并决定退出码。
+
+    退出码依据 `findings.json` 里的 `worst_confirmed_severity`，由报告节点在落盘时
+    一并写好——CLI 不自己重算严重度，避免「报告里写致命、门禁却放行」这类两处判定
+    不一致的问题。产物缺失（例如报告节点本身失败）时门槛不生效，只保留模块失败语义：
+    宁可放行也不能凭一个读不到的产物拦下构建。
+    """
+    stats = get_stats().snapshot()
+    filt = {"findings_total": 0, "refuted_rate": 0.0, "observation_rate": 0.0}
+    worst = ""
+    findings_path = _project_findings_path(config)
+    try:
+        export = json.loads(findings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("机器可读产物不可用，严重度门槛不生效: %s (%s)", findings_path, exc)
+        export = {}
+    if export:
+        worst = str(export.get("worst_confirmed_severity") or "")
+        counts = export.get("counts") or {}
+        total = int(counts.get("confirmed", 0)) + int(counts.get("refuted", 0)) + int(
+            counts.get("uncertain", 0)
+        )
+        filt = {
+            "findings_total": total,
+            "refuted": int(counts.get("refuted", 0)),
+            "observations": int(counts.get("observations", 0)),
+            "refuted_rate": round(int(counts.get("refuted", 0)) / total, 4) if total else 0.0,
+        }
+    threshold = FAIL_ON_RANK.get(fail_on)
+    triggered = bool(
+        worst and threshold is not None and fu.severity_rank(worst) <= threshold
+    )
+    exit_code = 0
+    if failed:
+        exit_code = EXIT_MODULE_FAILURE
+    elif triggered:
+        exit_code = EXIT_SEVERITY_THRESHOLD
+    return {
+        "report_path": result.get("report_path"),
+        "findings_path": str(findings_path),
+        "metrics_path": str(_metrics_path(config)),
+        "max_parallel": config.max_parallel,
+        "failed_modules": failed,
+        "worst_confirmed_severity": worst,
+        "exit_code": exit_code,
+        "llm_calls": stats["llm"]["calls"],
+        "total_tokens": stats["llm"]["total_tokens"],
+        "wall_clock": stats["wall_clock"],
+        "filter": filt,
+    }
 
 
 if __name__ == "__main__":
