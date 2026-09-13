@@ -23,7 +23,7 @@ from ...schemas import (
     ScanResult,
 )
 from ...state import ReviewState
-from ...tools.executors import c_scanner
+from ...tools.executors import c_scanner, static_analyzers
 from ..common import (
     _config,
     _execute_batch,
@@ -35,6 +35,7 @@ from ..common import (
     _truncate,
     _write_json,
 )
+from ..common import _load_tool_evidence as load_tool_evidence
 from ._base import _llm
 
 logger = get_logger(__name__)
@@ -174,6 +175,54 @@ def _enrich_and_split(
     return merged, observations, invalid
 
 
+def _tool_candidates(
+    scan: ScanResult,
+    module_files: set[str],
+    covered: set[tuple[str, int]],
+    entries: list[dict],
+    cache: dict[str, list[str]],
+) -> list[Finding]:
+    """补漏：工具独立报出、而模型在本模块**一个字都没提**的位置，转为候选 finding。
+
+    只在「该锚点上模型没有任何主张」时注入——模型已提到该语句时，工具的作用是印证或
+    裁决（在 `review_check`），再注入一条只会让同一条语句重复出卡。
+    """
+    candidates: list[Finding] = []
+    for entry, mapping in static_analyzers.injectable(entries):
+        file = entry.get("file", "")
+        line = int(entry.get("line") or 0)
+        if file not in module_files or line <= 0:
+            continue
+        if any(anchor_file == file and abs(anchor_line - line) <= static_analyzers.MATCH_TOLERANCE
+               for anchor_file, anchor_line in covered):
+            continue
+        finding = Finding(
+            id="",
+            file=file,
+            line=line,
+            category=mapping.category,
+            defect_kind=mapping.defect_kind,
+            severity=mapping.severity,
+            title=f"{entry.get('tool')} 独立检出：{entry.get('rule')}",
+            description=f"静态分析工具 {entry.get('tool')} 在该位置报告：{entry.get('message')}",
+            root_cause="由外部静态分析工具独立判定，未经模型归纳",
+            suggestion="按工具报告的规则修复该处，并补充回归用例",
+            impact=f"工具等级：{entry.get('severity')}；规则：{entry.get('rule')}",
+            evidence=f"{entry.get('tool')} 报告 {entry.get('rule')}：{entry.get('message')}",
+            call_chain=[],
+            channel="finding",
+            source="tool",
+            source_pass="tool",
+            tool_evidence=[entry],
+        )
+        enriched, location = _enrich(scan, finding, cache)
+        if location["status"] == "invalid":
+            logger.debug("[检视] 工具候选位置校验未通过，丢弃 %s:%s %s", file, line, location["reason"])
+            continue
+        candidates.append(enriched)
+    return candidates
+
+
 def _review_module_raw(
     scan: ScanResult,
     global_arch: GlobalArchitecture,
@@ -222,6 +271,27 @@ def _review_module_raw(
 
     merged, observations, invalid = _enrich_and_split(scan, raw_batches)
     total_raw = len(merged) + len(invalid)
+
+    # 补漏：工具独立报出、模型完全没提的位置补为候选 finding。这是纯增益的召回提升，
+    # 依据是「工具报告 = 该位置确实有问题」；反之（工具没报）绝不作任何推断。
+    tool_report = load_tool_evidence(cfg)
+    if tool_report.entries:
+        covered = {(f.file, f.line) for f in merged}
+        candidates = _tool_candidates(
+            scan,
+            module_files,
+            covered,
+            [e.model_dump() for e in tool_report.entries],
+            {},  # 独立缓存：候选数量少，且与上方批次解析无共享收益
+        )
+        if candidates:
+            logger.info(
+                "[检视] %s 工具补漏 %d 条: %s",
+                module,
+                len(candidates),
+                [f"{f.file}:{f.line} {f.defect_kind}" for f in candidates],
+            )
+            merged.extend(candidates)
 
     # 去重：同一锚点 + 同一缺陷种类算同一主张。按行号归并会丢掉同一语句上的不同缺陷
     # （实测 parser.c:13 上并存三个都成立的缺陷），故只在主张级别合并。

@@ -1,6 +1,6 @@
 """图组装：评审流程主编排图。
 
-  scan -> global_arch -> module_archs -> critical_paths -> merge
+  scan -> tool_evidence -> global_arch -> module_archs -> critical_paths -> merge
        -> (size_analysis -> review_module -> rebuttal_module -> review_check -> module_report -> advance)*N
        -> report -> END
 """
@@ -23,6 +23,7 @@ from .nodes.tool.report import report_node
 from .nodes.tool.review_check import review_check_node
 from .nodes.tool.scan import scan_node
 from .nodes.tool.size_analysis import size_analysis_node
+from .nodes.tool.tool_evidence import tool_evidence_node
 from .state import ReviewState
 
 logger = get_logger(__name__)
@@ -35,6 +36,7 @@ def _should_continue(state: ReviewState) -> str:
 
 builder = StateGraph(ReviewState)
 builder.add_node("scan", scan_node)
+builder.add_node("tool_evidence", tool_evidence_node)
 builder.add_node("global_arch", global_arch_node)
 builder.add_node("module_archs", module_archs_node)
 builder.add_node("critical_paths", critical_paths_node)
@@ -48,7 +50,8 @@ builder.add_node("advance", advance_node)
 builder.add_node("report", report_node)
 
 builder.add_edge(START, "scan")
-builder.add_edge("scan", "global_arch")
+builder.add_edge("scan", "tool_evidence")
+builder.add_edge("tool_evidence", "global_arch")
 builder.add_edge("global_arch", "module_archs")
 builder.add_edge("module_archs", "critical_paths")
 builder.add_edge("critical_paths", "merge")

@@ -82,7 +82,13 @@ def _claim_block(ordinal: str, finding: dict, verdict: dict | None) -> list[str]
     lines += [f"- **缺陷种类**：{kind}", ""]
     tool = finding.get("tool_evidence") or []
     if tool:
-        lines += ["- **工具印证**：" + "；".join(str(t) for t in tool), ""]
+        rendered = "；".join(
+            f"{t.get('tool')} `{t.get('rule')}` @{t.get('file')}:{t.get('line')}（{t.get('severity')}）"
+            if isinstance(t, dict)
+            else str(t)
+            for t in tool
+        )
+        lines += [f"- **工具印证**：{rendered}", ""]
     return lines
 
 

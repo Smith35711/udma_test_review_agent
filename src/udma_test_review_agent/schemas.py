@@ -154,6 +154,21 @@ class CriticalPathReport(BaseModel):
     paths: list[CriticalPath]
 
 
+class ToolEvidence(BaseModel):
+    """外部静态分析工具（gcc -fanalyzer / cppcheck）的独立发现。
+
+    定义在 `Finding` 之前，因为 `Finding.tool_evidence` 直接引用本模型——
+    结构化而非字符串，是为了让报告与评测能区分「哪个工具、哪条规则」印证了哪一条主张。
+    """
+
+    tool: str = Field(description="gcc-analyzer / cppcheck")
+    file: str
+    line: int = 0
+    rule: str = Field(description="工具规则名，如 use-after-free / doubleFree / CWE-416")
+    severity: str = Field(description="映射到本项目等级：提示/一般/严重/致命")
+    message: str
+
+
 class Finding(BaseModel):
     id: str = Field(description="f1/f2/... 编号")
     category: str = Field(description="memory/concurrency/trust_boundary/resource/logic/macro/ub 之一")
@@ -192,7 +207,7 @@ class Finding(BaseModel):
         description="位置校验结果：verified / unattributable / invalid（见 nodes/llm/review.py）",
         json_schema_extra=DETERMINISTIC,
     )
-    tool_evidence: list[str] = Field(
+    tool_evidence: list[ToolEvidence] = Field(
         default_factory=list, description="外部工具（gcc -fanalyzer / cppcheck）的印证条目", json_schema_extra=DETERMINISTIC
     )
 
@@ -233,24 +248,18 @@ class Verdict(BaseModel):
         default_factory=list, description="同主张上被保留的分歧结论原文", json_schema_extra=DETERMINISTIC
     )
     verdict_source: str = Field(
-        default="model", description="model=模型给出；fallback=模型漏回、由闸门降级补位", json_schema_extra=DETERMINISTIC
+        default="model",
+        description=(
+            "结论来源：model=模型给出；fallback=模型漏回、由闸门降级补位；"
+            "tool=被外部静态分析工具证据校正（印证或裁决）"
+        ),
+        json_schema_extra=DETERMINISTIC,
     )
     demoted_reason: str = Field(default="", description="被闸门降级的原因", json_schema_extra=DETERMINISTIC)
 
 
 class RebuttalReport(BaseModel):
     results: list[Verdict]
-
-
-class ToolEvidence(BaseModel):
-    """外部静态分析工具（gcc -fanalyzer / cppcheck）的独立发现。"""
-
-    tool: str = Field(description="gcc-analyzer / cppcheck")
-    file: str
-    line: int = 0
-    rule: str = Field(description="工具规则名，如 use-after-free / doubleFree / CWE-416")
-    severity: str = Field(description="映射到本项目等级：提示/一般/严重/致命")
-    message: str
 
 
 class ToolEvidenceReport(BaseModel):

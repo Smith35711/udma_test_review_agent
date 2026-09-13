@@ -11,7 +11,7 @@ from ..configuration import ReviewConfig
 from ..log import get_logger
 from ..manifest import MANIFEST_FILE
 from ..module_map import id_sort_key, parse_selection
-from ..schemas import GlobalArchitecture, ScanResult
+from ..schemas import GlobalArchitecture, ScanResult, ToolEvidenceReport
 from ..state import ReviewState
 
 logger = get_logger(__name__)
@@ -157,8 +157,29 @@ def _manifest_path(cfg: ReviewConfig) -> Path:
     return _output_dir(cfg) / MANIFEST_FILE
 
 
+def _load_tool_evidence(cfg: ReviewConfig) -> ToolEvidenceReport:
+    """读取工具证据产物；缺失或损坏时返回空报告（视同「本次没有工具证据」）。
+
+    **不抛异常**：工具层是补充信息，产物不可用不该阻断检视、反驳与核对阶段。
+    放在 common 而非工具节点里，是为了让检视与核对两侧都从同一处取用，
+    避免节点之间互相 import。
+    """
+    path = _tool_evidence_path(cfg)
+    if not path.exists():
+        return ToolEvidenceReport()
+    try:
+        return ToolEvidenceReport.model_validate(_read_json(path))
+    except (OSError, ValueError) as exc:
+        logger.warning("[工具证据] 产物不可用，按无证据处理: %s (%s)", path, exc)
+        return ToolEvidenceReport()
+
+
 def _global_arch_path(cfg: ReviewConfig) -> Path:
     return _output_dir(cfg) / "global_architecture.json"
+
+
+def _tool_evidence_path(cfg: ReviewConfig) -> Path:
+    return _output_dir(cfg) / "tool_evidence.json"
 
 
 def _critical_paths_path(cfg: ReviewConfig) -> Path:

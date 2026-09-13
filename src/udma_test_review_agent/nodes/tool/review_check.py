@@ -14,6 +14,7 @@ from ...configuration import ReviewConfig
 from ...log import get_logger
 from ...schemas import RawFindings
 from ...state import ReviewState
+from ...tools.executors import static_analyzers
 from ..common import (
     _config,
     _execute_batch,
@@ -23,6 +24,7 @@ from ..common import (
     _stats,
     _write_json,
 )
+from ..common import _load_tool_evidence as load_tool_evidence
 
 logger = get_logger(__name__)
 
@@ -73,6 +75,60 @@ def _demote(verdict: dict[str, Any], finding: dict[str, Any], threshold: float) 
             "demoted_reason": f"置信度 {confidence:.2f} 低于阈值 {threshold:.2f}，证据不足以确认",
         }
     return verdict
+
+
+def _apply_tool_evidence(
+    verdict: dict[str, Any], finding: dict[str, Any], entries: list[dict]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """用外部工具证据校正结论，返回 `(verdict, finding)`。**工具是独立真相源，不是第三个投票者。**
+
+    三档处置（依据「静态分析工具报告 = 该位置确实存在问题」这一确定性事实）：
+
+    - **同缺陷种类命中** —— 工具独立复现了模型的这条具体判断。这是最强的外部证据：
+      `refuted` 与 `uncertain` 一律升为 `confirmed`（工具不会因为「拿不准」而报错），
+      `confirmed` 保持并跳过置信度降级（工具已证实，模型自评的置信度不再重要）。
+    - **仅同位置命中**（工具在同一行报了别的缺陷）—— 该语句确实有问题，故**不允许
+      `refuted`**，降为 `uncertain` 并附证据交人工；但也不升为 confirmed——工具说的是
+      另一件事，不能替模型的这条断言背书。
+    - **无命中** —— 原样返回。**工具没报不等于没问题**：实测最重要的
+      `buffer.c:7` 无界 strcpy 两个工具都抓不到，用缺席当反证会直接造成漏报。
+    """
+    same_kind, same_place = static_analyzers.match_for(finding, entries)
+    if not same_kind and not same_place:
+        return verdict, finding
+    finding = {**finding, "tool_evidence": [*(finding.get("tool_evidence") or []), *same_kind, *same_place]}
+    if same_kind:
+        if verdict.get("conclusion") == "confirmed":
+            return verdict, finding
+        return (
+            {
+                **verdict,
+                "conclusion": "confirmed",
+                "confidence": max(float(verdict.get("confidence") or 0.0), 0.9),
+                "verdict_source": "tool",
+                "demoted_reason": "",
+                "rebuttal_opinion": (
+                    f"{verdict.get('rebuttal_opinion') or ''}"
+                    f" ｜ 外部工具独立证实：{same_kind[0].get('tool')} {same_kind[0].get('rule')}"
+                ).strip(" ｜"),
+            },
+            finding,
+        )
+    if verdict.get("conclusion") == "refuted":
+        return (
+            {
+                **verdict,
+                "conclusion": "uncertain",
+                "verdict_source": "tool",
+                "inconsistent": True,
+                "demoted_reason": (
+                    f"模型判定为误报，但 {same_place[0].get('tool')} 在同一位置报告 "
+                    f"{same_place[0].get('rule')}；工具缺席不等同于证伪，此处证据冲突交人工裁决"
+                ),
+            },
+            finding,
+        )
+    return verdict, finding
 
 
 def _resolve_claim_conflicts(ordered: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -159,6 +215,30 @@ def _review_check_one(cfg: ReviewConfig, state: ReviewState, module: str) -> dic
             )
 
     ordered = _resolve_claim_conflicts(ordered)
+    # 工具证据放在最后：它的证明力高于模型的置信度自评与「分歧无法裁决」这两条启发式，
+    # 故先让它们把结论定下来，再由外部证据做最终校正（或推翻）。
+    tool_entries = [e.model_dump() for e in load_tool_evidence(cfg).entries]
+    if tool_entries:
+        corroborated = 0
+        for item in ordered:
+            before = item["verdict"].get("conclusion")
+            item["verdict"], item["finding"] = _apply_tool_evidence(
+                item["verdict"], item["finding"], tool_entries
+            )
+            if item["verdict"].get("conclusion") != before:
+                corroborated += 1
+                logger.debug(
+                    "[审查] %s %s 工具证据校正 %s -> %s: %s",
+                    module,
+                    item["finding"].get("id"),
+                    before,
+                    item["verdict"].get("conclusion"),
+                    item["verdict"].get("demoted_reason") or "工具独立证实",
+                )
+        if corroborated:
+            logger.info(
+                "[审查] %s 工具证据校正 %d 条结论（外部静态分析独立印证/裁决）", module, corroborated
+            )
     ordered.sort(key=lambda i: (fu.severity_rank(i["verdict"].get("severity")), str(i["finding"].get("file")), int(i["finding"].get("line") or 0)))
 
     payload["results"] = ordered
