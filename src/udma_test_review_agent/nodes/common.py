@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from ..configuration import ReviewConfig
 from ..log import get_logger
+from ..manifest import MANIFEST_FILE
 from ..module_map import id_sort_key, parse_selection
 from ..schemas import GlobalArchitecture, ScanResult
 from ..state import ReviewState
@@ -150,6 +151,10 @@ def _truncate(text: str, limit: int = 12000) -> str:
 
 def _scan_persist_path(cfg: ReviewConfig) -> Path:
     return _output_dir(cfg) / "scan.json"
+
+
+def _manifest_path(cfg: ReviewConfig) -> Path:
+    return _output_dir(cfg) / MANIFEST_FILE
 
 
 def _global_arch_path(cfg: ReviewConfig) -> Path:

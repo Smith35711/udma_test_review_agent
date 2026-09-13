@@ -14,7 +14,8 @@ from pydantic import BaseModel, Field
 ARTIFACT_VERSION = 2
 """产物格式版本。断点续跑靠产物存在性判断，**改了 id 语义就必须升版本**：
 否则续跑会把旧格式的 `f1` 序号与新的锚点 id 混在同一批产物里，两边都不再自洽。
-各阶段的断点命中前先比对版本，不符即重算该阶段（见 `nodes/common.py::_artifact_stale`）。"""
+本值进入 `RunManifest.artifact_version` 并参与输入指纹，故升版本会让既有产物整体
+失效并重算（见 `manifest.py`）——这正是期望行为：格式变了，旧产物一律不可复用。"""
 
 DETERMINISTIC = {"deterministic": True}
 """标记「该字段由流水线填写、不进模型输出契约」。"""
@@ -274,3 +275,39 @@ class ReviewMeta(BaseModel):
     refuted: int
     uncertain: int
     observations: int
+
+
+class RunManifest(BaseModel):
+    """本次运行的输入指纹，用于判断断点产物是否仍然有效。
+
+    断点续跑靠「产物存在」判断，产物本身却不知道自己是在什么输入下产生的。
+    于是改动源码、换模型、改提示词之后重跑，S1–S3 会静默复用旧结论，与新的检视
+    结果混在一份报告里——两边都不再自洽，且完全无声。本清单在 scan 阶段落盘，
+    再次运行时逐字段比对，不一致即归档旧产物并全量重算。
+    """
+
+    version: int = 1
+    artifact_version: int = ARTIFACT_VERSION
+    created_at: str = Field(description="生成时间（本地时间，仅作展示）")
+    project_root: str
+    sources_digest: str = Field(description="全部 .c/.h 内容哈希的汇总")
+    sources: dict[str, str] = Field(default_factory=dict, description="相对路径 -> 内容哈希")
+    module_map_digest: str
+    prompts_digest: str
+    model_digest: str = Field(description="生效模型名/模型/端点/温度/种子")
+    thresholds: dict[str, object] = Field(default_factory=dict)
+    concurrency: int = 0
+    digest: str = Field(default="", description="以上全部输入的汇总哈希，用于快速比对（由 manifest.fingerprint 回填）")
+
+FINGERPRINT_FIELDS = (
+    "artifact_version",
+    "project_root",
+    "sources_digest",
+    "module_map_digest",
+    "prompts_digest",
+    "model_digest",
+    "thresholds",
+    "concurrency",
+)
+"""参与失效判定的字段。`created_at`/`sources`/`digest` 不入列：
+前两者是展示信息，后者是这些字段的汇总。"""

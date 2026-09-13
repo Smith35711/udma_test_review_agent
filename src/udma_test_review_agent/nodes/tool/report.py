@@ -6,10 +6,12 @@ import time
 from typing import Any
 
 from ...log import get_logger
+from ...manifest import load_manifest
 from ...state import ReviewState
 from ..common import (
     _config,
     _findings_verified_path,
+    _manifest_path,
     _module_dir,
     _module_size_path,
     _output_dir,
@@ -31,6 +33,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
     sections = []
     stats_rows = []
     output_dir = _output_dir(cfg)
+    run_manifest = load_manifest(_manifest_path(cfg))
     total = {"confirmed": 0, "refuted": 0, "uncertain": 0, "observations": 0}
     for module in order:
         if module in failures:
@@ -78,8 +81,12 @@ def report_node(state: ReviewState) -> dict[str, Any]:
     overall += [
         f"- 被测项目：`{cfg.project_root}`",
         f"- 模块选择：{cfg.modules} ｜ 模块数 {len(order)} ｜ 并发上限 {cfg.max_parallel or '自动'}",
-        f"- 模型配置：{cfg.model_profile or '(active)'} ｜ 小模块行数阈值 {cfg.small_module_line_threshold} ｜ "
-        f"单次上限 {cfg.max_findings_per_pass} ｜ 确认置信度阈值 {cfg.confirmed_confidence_threshold}",
+        f"- 模型配置：{cfg.model_profile or '(active)'} ｜ 采样温度 {cfg.temperature if cfg.temperature is not None else '条目默认'} ｜ "
+        f"种子 {cfg.seed if cfg.seed is not None else '未固定'}",
+        f"- 阈值：小模块行数 {cfg.small_module_line_threshold} ｜ 单次上限 {cfg.max_findings_per_pass} ｜ "
+        f"确认置信度 {cfg.confirmed_confidence_threshold}",
+        f"- 输入指纹：`{run_manifest.digest if run_manifest else '不可用'}`"
+        + (f" ｜ 源码文件 {len(run_manifest.sources)} 个" if run_manifest else ""),
         f"- 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
     ]

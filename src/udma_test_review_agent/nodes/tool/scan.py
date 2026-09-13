@@ -5,12 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ... import manifest, versioning
 from ...log import get_logger
 from ...module_map import load_modules_map
 from ...schemas import ScanResult
 from ...state import ReviewState
 from ...tools.executors import c_scanner
-from ..common import _config, _module_order, _read_json, _scan_persist_path, _write_json
+from ..common import (
+    _config,
+    _manifest_path,
+    _module_order,
+    _output_dir,
+    _read_json,
+    _scan_persist_path,
+    _write_json,
+)
 
 logger = get_logger(__name__)
 
@@ -27,6 +36,27 @@ def scan_node(state: ReviewState) -> dict[str, Any]:
         cfg.model_profile or "(active)",
         persisted,
     )
+    # 断点失效判定：先比对本轮输入指纹与上次落盘的清单。不一致说明既有产物是在
+    # 别的源码/模型/提示词下产生的，继续复用会让一份报告混着两套来源，故整体归档重算。
+    current = manifest.build_manifest(cfg)
+    manifest_path = _manifest_path(cfg)
+    stored = manifest.load_manifest(manifest_path)
+    if stored is None or stored.digest != current.digest:
+        changes = "；".join(manifest.describe_changes(stored, current))
+        run_ts = versioning.run_timestamp()
+        # 归档必须在写入新清单**之前**：archive_all 的清单里含 run_manifest.json，
+        # 先写后归档会把刚生成的新清单一起卷进 history，当前目录反而没有清单可用。
+        moved = versioning.archive_all(_output_dir(cfg), run_ts)
+        if moved:
+            logger.warning(
+                "[S0] 输入指纹已变化，归档 %d 个既有产物（run=%s），全量重算: %s", moved, run_ts, changes
+            )
+        else:
+            logger.info("[S0] 输入指纹已变化，无既有产物可归档，全量重算: %s", changes)
+    else:
+        logger.debug("[S0] 输入指纹一致 digest=%s 源码文件=%d", current.digest, len(current.sources))
+    manifest.save_manifest(manifest_path, current)
+
     scan: ScanResult | None = None
     if persisted.exists():
         scan = ScanResult.model_validate(_read_json(persisted))
