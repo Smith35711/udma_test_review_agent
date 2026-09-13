@@ -70,17 +70,30 @@ class SystemModule(BaseModel):
 
 
 class TrustEntry(BaseModel):
+    """信任面入口（外部输入进入系统的位置）。
+
+    `evidence` 与行级位置共同构成**可核对性**要求：实测这条约束此前完全缺失，
+    模型仅凭函数名 `release_twice` 就推断出一个「并发热点」，而样例工程没有任何
+    线程或同步原语——该推断随后扩散进每个模块的检视上下文，制造出一整类
+    「多线程并发写同一缓冲」的假阳性。没有行级代码依据的条目必须由产出方
+    （`nodes/llm/global_arch.py`）显式标记为推测，下游不得当作事实使用。
+    """
+
     file: str
     line: int = 0
     kind: str = Field(description="syscall/socket/file_io/argv/ipc/parse 之一")
     description: str
+    evidence: str = Field(default="", description="支撑该结论的代码依据（带行号的语句）")
 
 
 class ConcurrencyHotspot(BaseModel):
+    """并发热点：锁、共享状态、信号、fork 等并发使用点。`evidence` 要求同 `TrustEntry`。"""
+
     file: str
     line: int = 0
     kind: str = Field(description="mutex/cond/rwlock/atomic/signal/fork/shared_state 之一")
     description: str
+    evidence: str = Field(default="", description="支撑该结论的代码依据（带行号的语句）")
 
 
 class GlobalArchitecture(BaseModel):
@@ -215,6 +228,14 @@ class Finding(BaseModel):
 class RawFindings(BaseModel):
     findings: list[Finding]
     observations: list[Finding] = Field(default_factory=list)
+    checklist_gaps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "上游架构已定位到 file:line、而本轮检视既未出 finding 也未出 observation 的检查项。"
+            "由 `nodes/llm/review.py` 确定性计算后回填，**不由模型产出**——"
+            "它是「上游已知线索在下游丢失」这一漏检模式的显式记账，用于让漏检可见。"
+        ),
+    )
 
 
 class ReviewCheck(BaseModel):

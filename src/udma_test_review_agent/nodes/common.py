@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from ..configuration import ReviewConfig
@@ -218,16 +218,92 @@ def _module_order(cfg: ReviewConfig, scan: ScanResult) -> list[str]:
     return order
 
 
+def _belongs_to_module(file: str, module_files: set[str]) -> bool:
+    """某条全局架构条目是否属于本模块。
+
+    两种命中方式：完整相对路径相等，或 basename 在**本模块内唯一**命中（模型常把
+    `src/parser.c` 写成 `parser.c`）。检视上下文与高风险判定（`review.py::_module_flagged`）
+    必须共用本函数——两处规则不一致时，会出现「提示词里给了这条热点、却不认为本模块
+    高风险」或反之的静默错配。
+    """
+    path = str(file or "").replace("\\", "/").strip()
+    if not path:
+        return False
+    if path in module_files:
+        return True
+    base = PurePosixPath(path).name
+    return sum(1 for f in module_files if PurePosixPath(f).name == base) == 1
+
+
+def _entry_is_located(entry: Any) -> bool:
+    """信任面/并发热点条目是否**已被代码证实**（有行号且有代码依据）。
+
+    这是「已核实」与「推测」的唯一判据，`_global_context_for_module` 的分组与
+    `review.py::_module_flagged` 的高风险判定必须共用它——否则会出现「提示词把它当推测、
+    高风险判定却拿它触发专项检视」这类静默错配。
+    """
+    line = int(getattr(entry, "line", 0) or 0)
+    evidence = str(getattr(entry, "evidence", "") or "").strip()
+    return line > 0 and bool(evidence)
+
+
 def _global_context_for_module(global_arch: GlobalArchitecture, module: str, module_files: set[str]) -> str:
+    """渲染本模块相关的信任面/并发热点/惯例，**已核实与推测分开呈现**。
+
+    推测条目（模型未给出可核对的行级依据）不得与已核实条目混排：下游检视需要先知道
+    哪些结论是事实、哪些只是待证实的假设，否则一条凭函数名猜出来的「并发热点」会被
+    当作既有事实，直接生成假阳性。此处用显式标注代替静默过滤——丢弃会让上游的问题
+    不可见，混排会让下游误信，标注是唯一既保真又不误导的选择。
+    """
+    located: list[str] = []
+    speculative: list[str] = []
+    for kind, entries in (("信任面", global_arch.trust_entries), ("并发", global_arch.concurrency_hotspots)):
+        for entry in entries:
+            if not _belongs_to_module(entry.file, module_files):
+                continue
+            evidence = str(getattr(entry, "evidence", "") or "").strip()
+            line = int(getattr(entry, "line", 0) or 0)
+            text = f"{entry.file}:{line} {entry.kind} {entry.description}"
+            if _entry_is_located(entry):
+                located.append(f"[{kind}] {text} ｜依据：{evidence}")
+            else:
+                missing = "行号" if line <= 0 else "代码依据"
+                speculative.append(f"[{kind}] {text}（缺{missing}，未经证实）")
+    lines = located
+    if speculative:
+        lines += [
+            "以下条目**未提供可核对的行级代码依据，属于推测**：必须先在本模块源码中证实其成立，"
+            "证不成立则不得据此出 finding；不得把它们当作既有事实引用。"
+        ]
+        lines += [f"  {s}" for s in speculative]
+    lines += [f"[惯例] {c}" for c in global_arch.conventions]
+    return "\n".join(lines).strip() or "(无直接相关条目)"
+
+
+def _critical_paths_for_module(paths: list[dict[str, Any]], module_files: set[str]) -> str:
+    """渲染与本模块相关的关键路径，供检视提示词使用。
+
+    `critical_paths` 此前是一处**断头路**：S3 生成后没有任何下游消费者，而设计文档
+    要求 S4 的上下文包包含「本模块架构摘要 + 检查项 + 相关关键路径」。关键路径承载的
+    是跨模块数据流与并发时序——单个模块的源码里根本看不见、却决定缺陷是否可达的
+    那部分信息，恰恰是契约类与并发类断言能否成立的关键。
+    """
+    related: list[dict[str, Any]] = []
+    for path in paths or []:
+        steps = path.get("steps") or []
+        if any(_belongs_to_module(str(s.get("file", "")), module_files) for s in steps):
+            related.append(path)
+    if not related:
+        return "(本模块不涉及已识别的关键路径)"
     lines = []
-    for entry in global_arch.trust_entries:
-        if any(entry.file.startswith(f.rsplit("/", 1)[0]) or entry.file in module_files for f in module_files):
-            lines.append(f"[信任面] {entry.file}:{entry.line} {entry.kind} {entry.description}")
-    for spot in global_arch.concurrency_hotspots:
-        if spot.file in module_files or any(spot.file.endswith(f.split("/")[-1]) for f in module_files):
-            lines.append(f"[并发] {spot.file}:{spot.line} {spot.kind} {spot.description}")
-    convention = "\n".join(f"[惯例] {c}" for c in global_arch.conventions)
-    return ("\n".join(lines) + "\n" + convention).strip() or "(无直接相关条目)"
+    for path in related:
+        chain = " → ".join(
+            f"{s.get('file', '')}:{s.get('line', 0)} {s.get('description', '')}".strip()
+            for s in (path.get("steps") or [])
+        )
+        lines.append(f"[{path.get('category', '')}] {path.get('title', '')}：{chain}")
+        lines.append(f"  风险：{path.get('risk', '')}")
+    return "\n".join(lines)
 
 
 def _stats(results: list[dict], observations: int) -> dict[str, int]:

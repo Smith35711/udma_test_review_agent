@@ -29,7 +29,7 @@ def _finding_block(scan: ScanResult, finding: Finding, cache: dict[str, list[str
     # 以问题行为中心取片段（而非从函数头截断）：长函数尾部的 finding 否则会拿到
     # 一份不含该语句的「上下文」，反驳只能写证据不足或误判。
     func_name, excerpt = c_scanner.function_excerpt(scan, finding.file, finding.line, cache=cache)
-    callers = c_scanner.upstream_callers(scan, func_name) if func_name else []
+    callers = c_scanner.upstream_call_sites(scan, func_name, cache=cache) if func_name else []
     logger.debug(
         "[反驳] 入批 %s 位置=%s:%d 定位函数=%s 片段字符=%d 上游调用点=%d",
         finding.id,
@@ -45,7 +45,8 @@ def _finding_block(scan: ScanResult, finding: Finding, cache: dict[str, list[str
         f"finding: {json.dumps(payload, ensure_ascii=False)}\n"
         f"问题行上下文（{func_name or '未定位所属函数'}，行号以 | 左侧为准）：\n"
         f"{excerpt or '(未取到源码片段)'}\n"
-        f"上游调用点：\n" + ("\n".join(callers) or "(调用图中无上游调用点，可能为入口函数或近似调用图未覆盖)")
+        f"上游调用点代码：\n"
+        + ("\n\n".join(callers) or "(调用图中无上游调用点，可能为入口函数或近似调用图未覆盖)")
     )
 
 

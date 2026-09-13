@@ -288,6 +288,61 @@ def upstream_callers(scan: ScanResult, function_name: str) -> list[str]:
     ]
 
 
+def upstream_call_sites(
+    scan: ScanResult,
+    function_name: str,
+    *,
+    context: int = 8,
+    cache: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """返回上游调用点的**代码**（不只是函数名）。
+
+    反驳阶段此前只拿到 `foo (file.c)` 这样的名字：一条契约类断言是否成立，取决于调用点
+    究竟做了什么——是否校验了长度、是否持有锁、返回值有没有被检查。只给函数名，模型
+    无从核对，只能倾向 refuted，这是漏报的直接来源之一。
+
+    定位策略：先在本文件里按 `名字(` 找调用行；找不到（宏包装、函数指针、跨行调用等
+    文本级扫描器的固有盲区）则回退给出调用方函数体的开头一段。**尽力而为**，
+    取不到就返回空列表，绝不编造。
+    """
+    sites: list[str] = []
+    # 被调用函数自身的定义行不是调用点：同文件调用时，正则会在定义处先命中，
+    # 于是「上游调用点」会指向被反驳函数自己的签名——比不给代码更误导。
+    definition_lines = {
+        (f.file, f.start_line) for f in scan.functions if f.name == function_name
+    }
+    for edge in scan.call_graph:
+        if edge.callee != function_name:
+            continue
+        lines = _file_lines(scan, edge.caller_file, cache)
+        hit = 0
+        pattern = re.compile(rf"\b{re.escape(function_name)}\s*\(")
+        for idx, text in enumerate(lines, 1):
+            stripped = text.strip()
+            if not stripped or stripped.startswith(("/*", "*", "//")):
+                continue
+            if (edge.caller_file, idx) in definition_lines:
+                continue
+            if pattern.search(text):
+                hit = idx
+                break
+        if hit:
+            start = max(1, hit - context)
+            end = min(len(lines), hit + context)
+            body = "\n".join(f"{i:>5}| {lines[i - 1]}" for i in range(start, end + 1))
+            sites.append(f"{edge.caller} @{edge.caller_file}:{hit}\n{body}")
+            continue
+        func = next(
+            (f for f in scan.functions if f.file == edge.caller_file and f.name == edge.caller), None
+        )
+        if func is None:
+            continue
+        end = min(func.end_line, func.start_line + 2 * context)
+        body = "\n".join(f"{i:>5}| {lines[i - 1]}" for i in range(func.start_line, end + 1) if i <= len(lines))
+        sites.append(f"{edge.caller} @{edge.caller_file}:{func.start_line}（未定位到精确调用行，给出调用方函数体）\n{body}")
+    return sites
+
+
 def function_excerpt(
     scan: ScanResult,
     rel_path: str,

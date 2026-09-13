@@ -25,7 +25,11 @@ from ...schemas import (
 from ...state import ReviewState
 from ...tools.executors import c_scanner, static_analyzers
 from ..common import (
+    _belongs_to_module,
     _config,
+    _critical_paths_for_module,
+    _critical_paths_path,
+    _entry_is_located,
     _execute_batch,
     _findings_raw_path,
     _global_context_for_module,
@@ -42,7 +46,18 @@ logger = get_logger(__name__)
 
 
 def _checklist_text(arch: ModuleArchitecture) -> str:
-    return "\n".join(f"- [{i.category}] {i.item}" for i in arch.checklist) or "(无)"
+    """渲染检查项；**已定位到 file:line 的显式带出位置**。
+
+    带位置这件事是给模型看的信号：上游架构阶段已经把缺陷定位到了具体语句
+    （实测 `parser.c:17` 的 `count==0` 越界就在其中），而检视阶段此前完全丢掉这层信息，
+    于是「上游已知、下游丢失」——这正是最典型的漏检模式。位置带出来后，
+    提示词第三节的「逐项核对」才有可执行的对象。
+    """
+    lines = []
+    for item in arch.checklist:
+        location = f" @{item.file}:{item.line}" if item.file and item.line else ""
+        lines.append(f"- [{item.category}] {item.item}{location}")
+    return "\n".join(lines) or "(无)"
 
 
 def _interfaces_text(arch: ModuleArchitecture) -> str:
@@ -62,12 +77,24 @@ def _contract_text(arch: ModuleArchitecture) -> str:
 
 
 def _module_flagged(scan: ScanResult, global_arch: GlobalArchitecture, module: str) -> bool:
+    """本模块是否值得追加一次专项检视。
+
+    只认**已被代码证实**的条目（`_entry_is_located`）：专项检视是一次完整的额外 LLM 调用，
+    若让一条凭函数名猜出来的「并发热点」触发它，代价是白花钱 + 产出一整类假阳性。
+    模块归属与检视上下文共用 `_belongs_to_module`，避免两处规则不一致导致的静默错配。
+    """
     inventory = next(m for m in scan.modules if m.name == module)
     files = {f.path for f in inventory.files}
-    names = {Path(f).name for f in files}
-    entries = [e for e in global_arch.trust_entries if Path(e.file).name in names]
-    spots = [s for s in global_arch.concurrency_hotspots if Path(s.file).name in names]
-    return bool(entries or spots)
+    entries = [e for e in global_arch.trust_entries if _belongs_to_module(e.file, files)]
+    spots = [s for s in global_arch.concurrency_hotspots if _belongs_to_module(s.file, files)]
+    located = [e for e in (*entries, *spots) if _entry_is_located(e)]
+    if len(located) != len(entries) + len(spots):
+        logger.debug(
+            "[检视] %s 高风险判定忽略 %d 条未经证实的架构条目",
+            module,
+            len(entries) + len(spots) - len(located),
+        )
+    return bool(located)
 
 
 def _review_pass(prompt: str, cfg: ReviewConfig, pass_name: str) -> RawFindings:
@@ -223,23 +250,70 @@ def _tool_candidates(
     return candidates
 
 
+_CHECKLIST_LINE_TOLERANCE = 2
+"""检查项位置与 finding 位置的允许偏差。
+
+模型的 finding 行号常与检查项相差一两行（指向语句的开头而非关键字）。比对时留一点
+容差，避免把「已经检出了」误判成漏检——这个记账一旦虚高，就失去了督促作用。
+"""
+
+
+def _checklist_gaps(
+    arch: ModuleArchitecture, findings: list[Finding], observations: list[Finding]
+) -> list[str]:
+    """上游已定位到 file:line、而本轮既未出 finding 也未出 observation 的检查项。
+
+    这是对**漏检**的确定性记账：检查项带着行号进来，说明架构阶段已经看见了那里的问题，
+    若检视阶段整条无回应，就是信息在链路上丢失。此处只统计与告警，不改写结论——
+    检查项不成立本来也是合格结果，需要人工区分的是「核对过、判定不成立」与「压根没看」。
+    """
+    covered = {(f.file, f.line) for f in (*findings, *observations)}
+    gaps: list[str] = []
+    for item in arch.checklist:
+        if not (item.file and item.line):
+            continue
+        if any(
+            file == item.file and abs(line - item.line) <= _CHECKLIST_LINE_TOLERANCE
+            for file, line in covered
+        ):
+            continue
+        gaps.append(f"{item.file}:{item.line} [{item.category}] {item.item}")
+    return gaps
+
+
+def _critical_paths(state: ReviewState, cfg: ReviewConfig) -> list[dict[str, Any]]:
+    """取关键路径清单：优先 state，缺失时回退读产物。
+
+    关键路径只是上下文增益，取不到不该让检视失败——失败会连同该模块的检视一起丢掉，
+    代价远大于少一段上下文。
+    """
+    data = state.get("critical_paths")
+    if not data:
+        path = _critical_paths_path(cfg)
+        data = _read_json(path) if path.exists() else {}
+    return list((data or {}).get("paths") or [])
+
+
 def _review_module_raw(
     scan: ScanResult,
     global_arch: GlobalArchitecture,
     module: str,
     size_class: str,
     cfg: ReviewConfig,
+    state_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
     arch = ModuleArchitecture.model_validate(_read_json(_module_arch_path(cfg, module)))
     inventory = next(m for m in scan.modules if m.name == module)
     module_files = {f.path for f in inventory.files}
     global_context = _global_context_for_module(global_arch, module, module_files)
+    critical = _critical_paths_for_module(state_paths, module_files)
     common = {
         "module_arch": (
             f"职责={arch.responsibility}\n接口契约:\n{_interfaces_text(arch)}\n"
             f"并发契约: {_contract_text(arch)}\n检查项:\n{_checklist_text(arch)}"
         ),
         "global_context": global_context,
+        "critical_paths": critical,
     }
     raw_batches: list[RawFindings] = []
     if size_class == "small":
@@ -256,6 +330,7 @@ def _review_module_raw(
                 continue
             prompt = DOMAIN_REVIEW_PROMPT.format(
                 module_arch=common["module_arch"],
+                critical_paths=critical,
                 headers=headers,
                 source=c_scanner.file_source_text(scan, file_info.path),
             )
@@ -264,6 +339,7 @@ def _review_module_raw(
     if flagged:
         prompt = FOCUSED_REVIEW_PROMPT.format(
             module_arch=common["module_arch"],
+            critical_paths=critical,
             source=_truncate(c_scanner.module_source_text(scan, module), 60000),
         )
         raw_batches.append(_review_pass(prompt, cfg, "focused"))
@@ -341,14 +417,20 @@ def _review_module_raw(
         redundant,
         len(invalid),
     )
+    gaps = _checklist_gaps(arch, final_findings, kept_observations)
     logger.info(
-        "[检视] %s findings=%d observations=%d%s",
+        "[检视] %s findings=%d observations=%d%s%s",
         module,
         len(final_findings),
         len(kept_observations),
         f"（{len(invalid)} 条因位置无效降级）" if invalid else "",
+        f"｜带位置检查项未回应 {len(gaps)} 条" if gaps else "",
     )
-    return RawFindings(findings=final_findings, observations=kept_observations).model_dump()
+    if gaps:
+        logger.warning("[检视] %s 以下已定位检查项本轮无任何回应（可能漏检）: %s", module, gaps)
+    return RawFindings(
+        findings=final_findings, observations=kept_observations, checklist_gaps=gaps
+    ).model_dump()
 
 
 def _review_one(
@@ -357,13 +439,14 @@ def _review_one(
     global_arch: GlobalArchitecture,
     module: str,
     size_class: str,
+    state_paths: list[dict[str, Any]],
 ) -> dict[str, Any]:
     if _findings_raw_path(cfg, module).exists():
         logger.info("[检视] 命中断点: %s", module)
         return {"module_raw": {module: _read_json(_findings_raw_path(cfg, module))}}
 
     started = time.monotonic()
-    data = _review_module_raw(scan, global_arch, module, size_class, cfg)
+    data = _review_module_raw(scan, global_arch, module, size_class, cfg, state_paths)
     _write_json(_findings_raw_path(cfg, module), data)
     logger.info("[检视] %s 完成，耗时 %.1fs", module, time.monotonic() - started)
     return {"module_raw": {module: data}}
@@ -392,8 +475,9 @@ def review_module_node(state: ReviewState) -> dict[str, Any]:
     scan = ScanResult.model_validate(state["scan"])
     global_arch = GlobalArchitecture.model_validate(state["global_arch"])
     sizes = state.get("module_size") or {}
+    paths = _critical_paths(state, cfg)
 
     def _run(module: str) -> dict[str, Any]:
-        return _review_one(cfg, scan, global_arch, module, _size_class(cfg, sizes, module))
+        return _review_one(cfg, scan, global_arch, module, _size_class(cfg, sizes, module), paths)
 
     return _execute_batch("review_module", state, _run, channel="module_raw")

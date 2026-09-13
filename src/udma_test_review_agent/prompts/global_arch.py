@@ -99,7 +99,11 @@ kind 枚举：syscall / socket / file_io / argv / ipc / parse。
 38. 输入进入状态机的边界。
 39. 输入进入缓存的键构造边界。
 40. 输入进入错误处理/日志的边界。
-每条给出 file、近似 line、kind 与一句话 description。
+每条必须给出 file、line、kind、一句话 description 与 evidence（支撑该结论的代码语句）。
+**证据要求（硬性）**：
+- line 必须是该文件中真实存在、且与结论直接相关的行号；给不出行号的条目不要输出；
+- evidence 必须是输入中可直接看到的语句原文（可带行号），不得用 description 复述充数；
+- 不得仅凭函数名、文件名或命名习惯推断外部输入的存在——看不到实际入口就不要写。
 
 # 七、并发热点（concurrency_hotspots）检查清单
 kind 枚举：mutex / cond / rwlock / atomic / signal / fork / shared_state。
@@ -144,7 +148,15 @@ kind 枚举：mutex / cond / rwlock / atomic / signal / fork / shared_state。
 38. 内存池的并发访问。
 39. 日志/统计的并发写入。
 40. 全局错误状态（errno）的并发使用。
-每条给出 file、近似 line、kind 与一句话 description。
+每条必须给出 file、line、kind、一句话 description 与 evidence（支撑该结论的代码语句）。
+**证据要求（硬性）**：
+- line 必须是该文件中真实存在、且与结论直接相关的行号；给不出行号的条目不要输出；
+- evidence 必须是输入中可直接看到的语句原文（如 `pthread_mutex_lock(&m)`）；
+- **不得仅凭函数名推断**：名字里含 release / destroy / free / sync 不等于存在共享状态或并发；
+- `shared_state` 指**被并发访问**的共享状态，不是泛指全局变量；只有全局/静态变量而没有任何
+  锁、线程、atomic、signal、fork 证据时，不要把它列为并发热点；
+- 输入中看不到任何同步原语时，本字段输出 `[]` 是**合格且首选**的答案。凭空写出并发热点，
+  会让下游每个模块都产生一整类并不存在的并发缺陷，代价远高于留空。
 
 # 八、项目惯例（conventions）
 - 内存所有权：谁分配、谁释放、是否借用。
@@ -194,17 +206,11 @@ kind 枚举：mutex / cond / rwlock / atomic / signal / fork / shared_state。
       "file": "parser.c",
       "line": 6,
       "kind": "parse",
-      "description": "parse_records 接收外部数据指针与数量"
+      "description": "parse_records 接收外部数据指针与数量",
+      "evidence": "6| int parse_records(const char *data, size_t count)"
     }}
   ],
-  "concurrency_hotspots": [
-    {{
-      "file": "buffer.c",
-      "line": 12,
-      "kind": "mutex",
-      "description": "buffer 写入路径使用互斥锁保护"
-    }}
-  ],
+  "concurrency_hotspots": [],
   "conventions": [
     "内存由调用方负责释放，模块内不保留所有权",
     "错误以负 errno 返回，0 表示成功"
@@ -214,10 +220,11 @@ kind 枚举：mutex / cond / rwlock / atomic / signal / fork / shared_state。
 # 十三、字段级要求
 - layers：字符串数组，按层次顺序排列，每项为“层名：职责”。
 - modules：数组，每项含 name / responsibility / entry。
-- trust_entries：数组，每项含 file / line / kind / description；kind 取枚举。
-- concurrency_hotspots：数组，每项含 file / line / kind / description；kind 取枚举。
+- trust_entries：数组，每项含 file / line / kind / description / evidence；kind 取枚举。
+- concurrency_hotspots：数组，每项含 file / line / kind / description / evidence；kind 取枚举。
 - conventions：字符串数组，可为空数组。
-- 所有 file 使用相对被测项目根的路径；line 为整数或 0（未知时）。
+- 所有 file 使用相对被测项目根的路径；line 为正整数，**取不到行号就不要输出该条**。
+- trust_entries 与 concurrency_hotspots 的 evidence 不得为空；空数组是允许且常见的取值。
 - 无内容时写 []，不得省略字段。
 
 # 十四、负向约束
@@ -228,7 +235,7 @@ kind 枚举：mutex / cond / rwlock / atomic / signal / fork / shared_state。
 # 十五、输出前自检
 1. 顶层仅含 layers / modules / trust_entries / concurrency_hotspots / conventions 五个键；
 2. 各数组元素字段齐全，kind 取自枚举；
-3. file 为相对路径，line 为整数；
+3. file 为相对路径，line 为正整数，evidence 非空且为可见语句，二者不互相矛盾；
 4. 无内容用 []，无 null 与占位符；
 5. 所有结论可在输入中找到依据；
 6. 输出以 {{ 开头、以 }} 结尾，且无任何多余字符。
@@ -246,13 +253,14 @@ includes：parser.c -> parser.h；buffer.c -> buffer.h。
     {{"name": "buffer", "responsibility": "管理缓冲区的读写", "entry": "buffer.c"}}
   ],
   "trust_entries": [
-    {{"file": "parser.c", "line": 6, "kind": "parse", "description": "解析入口接收外部数据"}}
+    {{"file": "parser.c", "line": 6, "kind": "parse", "description": "解析入口接收外部数据",
+      "evidence": "6| int parse_records(const char *data, size_t count)"}}
   ],
-  "concurrency_hotspots": [
-    {{"file": "buffer.c", "line": 12, "kind": "mutex", "description": "缓冲区写入加锁"}}
-  ],
+  "concurrency_hotspots": [],
   "conventions": ["内存由调用方释放"]
 }}
+说明：上面 concurrency_hotspots 为空，是因为该输入中没有任何同步原语——有依据时才填，
+结构同 trust_entries。空数组不扣分，凭空写出并发热点会直接制造下游假阳性。
 
 # 十七、常见错误（务必避免）
 1. 把未出现的模块写进 modules。
@@ -265,6 +273,9 @@ includes：parser.c -> parser.h；buffer.c -> buffer.h。
 8. 无内容时省略数组字段。
 9. 用 null 或占位符填充。
 10. 忽略输入中的截断说明而臆断。
+11. 仅凭函数名或命名习惯推断信任面/并发热点（如见 release 就写 shared_state）。
+12. 把普通全局变量当作并发热点。
+13. evidence 留空、或把 description 原样复述一遍充当 evidence。
 
 # 十八、边界情况
 - 单模块项目：layers 可为单层，modules 一条。
@@ -283,7 +294,8 @@ includes：parser.c -> parser.h；buffer.c -> buffer.h。
 - concurrency_hotspots 的 file 是否都在模块文件中；
 - conventions 是否可追溯到具体代码或注释；
 - kind 取值是否都在枚举内；
-- line 是否为整数；
+- line 是否为正整数且落在该文件行数内；
+- 每条 trust_entries / concurrency_hotspots 的 evidence 是否非空且来自输入；
 - 是否存在重复的入口或热点条目；
 - 是否存在同一位置被同时标为信任面与并发热点的情况（可并存，但须分别说明）；
 - 数组元素数量是否与输入规模相称，避免堆砌。

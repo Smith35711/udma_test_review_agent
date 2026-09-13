@@ -66,6 +66,13 @@ category 枚举：memory / concurrency / trust_boundary / resource / logic / mac
 - 每个类别至少给出与该模块相关的项，无关类别可少给。
 - 检查项必须具体，例如“校验 parse_records 的 count 上界”，而非“检查内存安全”。
 - 清单将作为下游检视的逐项核对表，务必可执行。
+- **凡指向具体语句的检查项，必须给出 file、line 与 evidence（该语句原文）**：
+  下游检视拿不到源码以外的东西，你在这里定位到的那一行，就是它能直接核对的那一行。
+  实测样例：`count == 0` 时的越界写入若能在此处带上 `parser.c:17` 与语句原文，
+  下游即可直接核实并出 finding；不带位置，这条线索在整条链路上就丢失了。
+- 只有当检查项确实是**跨文件、跨函数的通例**（如“确认所有调用点都校验了长度”）才允许
+  不落行号，此时 file 与 line 留空、evidence 可给出代表性语句；不得因为定位困难而整条省略位置。
+- 不得编造行号：给不出准确位置时按上一条处理，编造的位置比没有位置更有害。
 
 # 九、接口检查要点
 1. 每个对外函数是否都有签名记录。
@@ -207,11 +214,17 @@ category 枚举：memory / concurrency / trust_boundary / resource / logic / mac
   "checklist": [
     {{
       "category": "memory",
-      "item": "校验 count 上界与乘法溢出，避免 malloc 欠分配"
+      "item": "校验 count 上界与乘法溢出，避免 malloc 欠分配",
+      "file": "parser.c",
+      "line": 7,
+      "evidence": "7| size_t size = count * sizeof(Record);"
     }},
     {{
       "category": "trust_boundary",
-      "item": "校验 data 非空与可用长度，避免越界读"
+      "item": "校验 data 非空与可用长度，避免越界读",
+      "file": "",
+      "line": 0,
+      "evidence": "通例：所有读取 data 的调用点都应先校验长度"
     }}
   ]
 }}
@@ -222,21 +235,25 @@ category 枚举：memory / concurrency / trust_boundary / resource / logic / mac
 - interfaces：数组，每项含 signature / file / line / precondition / input_validated / is_boundary。
 - domains：数组，每项含 name / files / description。
 - concurrency_contract：对象，含 thread_model / caller_locked / internal_locks。
-- checklist：数组，每项含 category / item；category 取自枚举。
+- checklist：数组，每项含 category / item / file / line / evidence；category 取自枚举。
+  file 为相对路径，line 为正整数，evidence 为该行语句原文；通例类检查项 file 用空串、line 用 0，
+  但 evidence 仍须说明依据。
 - 无内容时写 [] 或空字符串，不得省略字段。
 
 # 十六、负向约束
 - 仅输出 JSON 对象本身，不得输出 Markdown 代码围栏、解释、前后缀文字或注释；
 - 不得新增、遗漏或重命名字段；不得使用 null、省略号或占位符；
-- 不得编造接口、文件或行号；不得臆造线程模型。
+- 不得编造接口、文件或行号；不得臆造线程模型；
+- checklist 中指向具体语句的项不得省略 file / line / evidence（省略等于把线索丢掉）。
 
 # 十七、输出前自检
 1. 顶层含 module / responsibility / interfaces / domains / concurrency_contract / checklist 六个键；
 2. interfaces、domains、checklist 元素字段齐全；
 3. thread_model 取自枚举；checklist.category 取自枚举；
-4. 无内容用 [] 或空串，无 null 与占位符；
-5. 所有结论可在输入中找到依据；
-6. 输出以 {{ 开头、以 }} 结尾，且无任何多余字符。
+4. 每条指向具体语句的 checklist 项都已给出 file / line / evidence，且行号真实存在；
+5. 无内容用 [] 或空串，无 null 与占位符；
+6. 所有结论可在输入中找到依据；
+7. 输出以 {{ 开头、以 }} 结尾，且无任何多余字符。
 
 # 十八、示例
 ## 输入片段
@@ -254,8 +271,10 @@ category 枚举：memory / concurrency / trust_boundary / resource / logic / mac
   ],
   "concurrency_contract": {{"thread_model": "single_thread", "caller_locked": [], "internal_locks": ["无内部锁"]}},
   "checklist": [
-    {{"category": "memory", "item": "校验 count 上界与乘法溢出"}},
-    {{"category": "trust_boundary", "item": "校验 data 非空与可用长度"}}
+    {{"category": "memory", "item": "校验 count 上界与乘法溢出", "file": "parser.c", "line": 7,
+      "evidence": "7| size_t size = count * sizeof(Record);"}},
+    {{"category": "trust_boundary", "item": "校验 data 非空与可用长度", "file": "", "line": 0,
+      "evidence": "通例：所有读取 data 的调用点都应先校验长度"}}
   ]
 }}
 
@@ -270,6 +289,7 @@ category 枚举：memory / concurrency / trust_boundary / resource / logic / mac
 8. 输出围栏或额外解释。
 9. 无内容时省略字段。
 10. 用 null 或占位符填充。
+11. 能定位到语句的检查项却不给 file / line / evidence，让下游无从核对。
 
 # 二十、边界情况
 - 无头文件：interfaces 可为空，但需说明依据。

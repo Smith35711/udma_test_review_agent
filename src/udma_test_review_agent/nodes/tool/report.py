@@ -35,6 +35,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
     output_dir = _output_dir(cfg)
     run_manifest = load_manifest(_manifest_path(cfg))
     total = {"confirmed": 0, "refuted": 0, "uncertain": 0, "observations": 0}
+    all_gaps: list[tuple[str, str]] = []
     for module in order:
         if module in failures:
             logger.warning("[报告] %s 评审失败，未计入统计: %s", module, failures[module])
@@ -50,6 +51,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
             continue
         for key in total:
             total[key] += counts.get(key, 0)
+        all_gaps += [(module, gap) for gap in (payload.get("checklist_gaps") or [])]
         stats_rows.append(
             f"| {module} | {len(payload['results'])} | {counts['confirmed']} | {counts['refuted']} | "
             f"{counts['uncertain']} | {counts['observations']} |"
@@ -99,6 +101,18 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         f"合计: confirmed={total['confirmed']} refuted={total['refuted']} uncertain={total['uncertain']} observations={total['observations']}",
         "",
     ]
+    if all_gaps:
+        # 漏检记账汇总：这些是上游已经定位到具体语句、检视阶段却没有任何回应的检查项。
+        # 放在总报告最显眼的位置，是因为它们**最像漏报**——人工复核应从这里开始。
+        overall += [
+            f"## ⚠️ 已定位但无回应的检查项（{len(all_gaps)} 条，优先人工复核）",
+            "",
+            "> 上游架构阶段已把这些检查项定位到具体 file:line，检视阶段既未出 finding 也未出"
+            " observation。可能是漏检，也可能是核对后判定不成立——需人工区分。",
+            "",
+        ]
+        overall += [f"- `{module}` {gap}" for module, gap in all_gaps]
+        overall += [""]
     if failures:
         overall += [f"> 注意：{len(failures)}/{len(order)} 个模块评审失败，未计入上述统计。", ""]
     if state.get("cross_module_candidates"):

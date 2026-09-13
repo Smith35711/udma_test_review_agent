@@ -206,9 +206,16 @@ def render_module_report(
         f"confirmed {len(confirmed)} · uncertain {len(uncertain)} · refuted {len(refuted)} ｜ "
         f"observations {len(observations)}",
         "",
-        "---",
-        "",
     ]
+    gaps = payload.get("checklist_gaps") or []
+    if gaps:
+        lines += [
+            f"> ⚠️ **{len(gaps)} 条上游已定位的检查项本轮无任何回应**（可能漏检，请人工复核）：",
+            "",
+        ]
+        lines += [f"> - `{gap}`" for gap in gaps]
+        lines += [""]
+    lines += ["---", ""]
 
     index = 0
     lines += ["## 已确认问题（confirmed）", ""]
