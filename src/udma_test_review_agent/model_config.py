@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -31,8 +32,44 @@ INHERITABLE_FIELDS = frozenset(
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
+_OPENCODE_CONFIG_DEFAULT = Path.home() / ".config" / "opencode" / "opencode.json"
+"""opencode 全局配置的默认路径，作为密钥的最后一级回退来源。"""
+
+
 class ModelConfigError(ValueError):
     """模型配置缺失或非法。"""
+
+
+def load_deepseek_config(config_path: str | os.PathLike | None = None) -> dict[str, str]:
+    """读取 opencode 全局配置中的 deepseek provider 选项（apiKey/baseURL）。
+
+    该文件是密钥的兜底来源；读取失败一律返回空字典，由调用方决定是否报错。
+    """
+    path = Path(config_path or os.getenv("OPENCODE_CONFIG", _OPENCODE_CONFIG_DEFAULT))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    try:
+        options = data["provider"]["deepseek"]["options"]
+    except (KeyError, TypeError):
+        return {}
+    return {key: options[key] for key in ("apiKey", "baseURL") if options.get(key)}
+
+
+def resolve_api_key(spec: ModelSpec) -> str:
+    """解析模型实际可用的 API Key：条目字面量 > 环境变量 > opencode 全局配置。
+
+    **这是唯一副本，运行期与 `--list-models` 共用。** 此前 `describe_models` 只看
+    `spec.api_key`，而运行期 `llm.py` 还会继续回退到 `DEEPSEEK_API_KEY` /
+    `LLM_API_KEY` / `~/.config/opencode/opencode.json`——于是配置文件里用
+    `${DEEPSEEK_API_KEY}` 引用（展开后为空）的模型，列表显示「未配置」却能正常跑，
+    用户会据此误判该换模型。密钥本体只在运行期读取，本函数不打印任何取值。
+    """
+    if spec.api_key:
+        return spec.api_key
+    config = load_deepseek_config()
+    return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or config.get("apiKey", "")
 
 
 def _expand_env(value: str) -> str:
@@ -402,7 +439,7 @@ def describe_models(
             provider=spec.provider,
             type=spec.type,
             base_url=spec.base_url,
-            has_api_key=bool(spec.api_key),
+            has_api_key=bool(resolve_api_key(spec)),
             active=spec.name == config.active,
         )
         for spec in config.models

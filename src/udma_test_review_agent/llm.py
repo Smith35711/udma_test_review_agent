@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import threading
 import time
 import uuid
-from pathlib import Path
 from typing import Sequence
 
 from langchain_core.language_models import BaseChatModel
@@ -16,31 +14,10 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .log import get_logger
-from .model_config import ModelSpec, resolve_model
+# load_deepseek_config 一并转出，保持 `llm.load_deepseek_config` 的既有可达性
+from .model_config import ModelSpec, load_deepseek_config, resolve_api_key, resolve_model
 
 logger = get_logger(__name__)
-
-_OPENCODE_CONFIG_DEFAULT = Path.home() / ".config" / "opencode" / "opencode.json"
-
-
-def load_deepseek_config(config_path: str | os.PathLike | None = None) -> dict[str, str]:
-    path = Path(config_path or os.getenv("OPENCODE_CONFIG", _OPENCODE_CONFIG_DEFAULT))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    try:
-        options = data["provider"]["deepseek"]["options"]
-    except (KeyError, TypeError):
-        return {}
-    return {key: options[key] for key in ("apiKey", "baseURL") if options.get(key)}
-
-
-def _resolve_api_key(spec: ModelSpec) -> str:
-    if spec.api_key:
-        return spec.api_key
-    cfg = load_deepseek_config()
-    return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or cfg.get("apiKey", "")
 
 
 def create_llm(
@@ -54,7 +31,7 @@ def create_llm(
     api_key: str | None = None,
 ) -> BaseChatModel:
     spec = resolve_model(profile)
-    resolved_api_key = api_key or _resolve_api_key(spec)
+    resolved_api_key = api_key or resolve_api_key(spec)
     if not resolved_api_key:
         raise ValueError(
             f"模型 {spec.name} 缺少 API Key：请在配置文件的 api_key 填写字面量或 ${{环境变量名}}"
@@ -126,7 +103,7 @@ def _build_client(spec: ModelSpec, base_url: str | None = None) -> OpenAI:
     builder = _PROVIDERS.get(spec.type)
     if builder is None:
         raise ValueError(f"不支持的模型类型: {spec.type}，可选: {sorted(_PROVIDERS)}")
-    api_key = _resolve_api_key(spec)
+    api_key = resolve_api_key(spec)
     if not api_key:
         raise ValueError(
             f"模型 {spec.name} 缺少 API Key：请在配置文件的 api_key 填写字面量或 ${{环境变量名}}"
@@ -232,6 +209,8 @@ def stream_llm_once(
     first_token_timeout: float = LLM_FIRST_TOKEN_TIMEOUT,
     chunk_timeout: float = LLM_CHUNK_TIMEOUT,
     include_reasoning: bool = False,
+    temperature: float | None = None,
+    seed: int | None = None,
 ) -> str | tuple[str, str] | BaseModel:
     """唯一 LLM 对外接口：内部流式接收，外部一次性返回。
 
@@ -243,6 +222,7 @@ def stream_llm_once(
     (思维链, 正文) 二元组）；
     schema 为 Pydantic 模型时启用 JSON 结构化输出，返回校验后的实例。
     profile 指定模型配置中的 name；为空时依 LLM_PROFILE 环境变量或配置 active。
+    temperature 为 None 时取模型条目的 temperature；seed 为 None 时不发送该参数。
     """
     spec = resolve_model(profile)
     model = model or spec.model
@@ -274,6 +254,13 @@ def stream_llm_once(
 
     client = _build_client(spec, base_url=base_url)
     events: queue.Queue[tuple[str, object]] = queue.Queue()
+    # 采样参数此前被完全忽略：配置里的 temperature 只走 create_llm 那条 langchain 路径，
+    # 而生产节点全部走本函数，等于实际使用供应商默认值。显式透传后配置才真正生效。
+    sampling: dict[str, object] = {"temperature": spec.temperature if temperature is None else temperature}
+    if seed is not None:
+        # seed 只降低采样随机性，不保证输出确定（服务端实现与并发都可能引入差异），
+        # 因此它是「方差的一个来源」而非「可复现性保证」。
+        sampling["seed"] = seed
 
     def _worker() -> None:
         try:
@@ -283,6 +270,7 @@ def stream_llm_once(
                 stream=True,
                 stream_options={"include_usage": True},
                 **({"response_format": response_format} if response_format else {}),
+                **sampling,
             )
             with stream:
                 for chunk in stream:

@@ -16,7 +16,6 @@ class ReviewConfig:
     project_root: str
     modules: str = "all"
     model_profile: str = ""
-    excludes: tuple[str, ...] = (".git", "build", "temp")
     small_module_line_threshold: int = 2000
     max_review_attempts: int = 3
     first_token_timeout: float = 60.0
@@ -31,6 +30,23 @@ class ReviewConfig:
     confirmed_confidence_threshold: float = 0.6
     # 位置校验：把「文件不在扫描范围/行号越界/空行或注释」的 finding 降级为 observation
     demote_invalid_location: bool = True
+    # 采样温度：None 表示沿用模型条目自己的 temperature。
+    # 此前流式路径根本不发送该参数，配置里的 temperature 对生产节点完全无效。
+    temperature: float | None = None
+    # 采样种子：None 表示不发送。仅用于压低重复运行之间的方差，不承诺输出确定。
+    seed: int | None = None
+    # 扫描排除目录。**这是唯一真相来源**，由扫描节点传给 c_scanner；
+    # 原先 ReviewConfig 里有本字段而扫描器另有一份常量，配置写了不生效。
+    excludes: tuple[str, ...] = (
+        ".git",
+        ".svn",
+        "__pycache__",
+        "build",
+        "out",
+        "dist",
+        "node_modules",
+        ".venv",
+    )
 
     def __post_init__(self) -> None:
         if self.model_profile:
@@ -39,6 +55,8 @@ class ReviewConfig:
             raise ValueError(f"并发数不能为负: {self.max_parallel}")
         if not 0.0 <= self.confirmed_confidence_threshold <= 1.0:
             raise ValueError(f"置信度阈值须在 0..1 之间: {self.confirmed_confidence_threshold}")
+        if self.temperature is not None and not 0.0 <= self.temperature <= 2.0:
+            raise ValueError(f"采样温度须在 0..2 之间: {self.temperature}")
         modules_map = load_modules_map()
         parse_selection(self.modules, [m.id for m in modules_map.modules])
         if not self.output_root:

@@ -16,8 +16,35 @@ from ..state import ReviewState
 logger = get_logger(__name__)
 
 
+_CONFIG_CACHE: dict[tuple, ReviewConfig] = {}
+_CONFIG_CACHE_MAX = 8
+"""`_config` 的解析结果缓存。
+
+`ReviewConfig.__post_init__` 会解析模型配置（读 YAML）、加载模块映射、校验被测目录
+是否存在——而**每个节点、每轮循环**都会调用一次 `_config`，同一次运行内这些输入
+完全相同。缓存后一次运行只解析一次。上限 8 仅为防止长驻进程（Web 用法）无限增长。
+"""
+
+
 def _config(state: ReviewState) -> ReviewConfig:
-    return ReviewConfig(**state["config"])
+    """从 state 重建 ReviewConfig。
+
+    **返回的对象按只读对待**：命中缓存时多个节点共享同一实例，改写它会污染后续节点。
+    state["config"] 是 `asdict()` 产物（值均为可哈希的标量/元组），故可用内容作缓存键。
+    """
+    raw = state["config"]
+    try:
+        key = tuple(sorted(raw.items()))
+        hash(key)
+    except TypeError:  # 出现不可哈希取值时退回不缓存，正确性优先
+        return ReviewConfig(**raw)
+    cached = _CONFIG_CACHE.get(key)
+    if cached is None:
+        cached = ReviewConfig(**raw)
+        if len(_CONFIG_CACHE) >= _CONFIG_CACHE_MAX:
+            _CONFIG_CACHE.pop(next(iter(_CONFIG_CACHE)))
+        _CONFIG_CACHE[key] = cached
+    return cached
 
 
 _AUTO_PARALLEL = 8

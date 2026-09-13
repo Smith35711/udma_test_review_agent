@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 from ...log import get_logger
@@ -18,7 +19,9 @@ from ...schemas import (
 
 logger = get_logger(__name__)
 
-EXCLUDE_DIRS = {".git", ".svn", "__pycache__", "build", "out", "dist", "node_modules", ".venv"}
+DEFAULT_EXCLUDE_DIRS = frozenset({".git", ".svn", "__pycache__", "build", "out", "dist", "node_modules", ".venv"})
+"""默认排除目录。仅作为未显式传入 `exclude_dirs` 时的兜底；生产路径由
+`ReviewConfig.excludes`（唯一真相来源）经 `scan_project` 传入。"""
 C_SUFFIXES = {".c", ".h"}
 C_KEYWORDS = {
     "if", "else", "for", "while", "switch", "return", "sizeof", "typedef", "do",
@@ -52,12 +55,12 @@ def _function_header_name(line: str) -> str | None:
     return name
 
 
-def _iter_source_files(root: Path) -> list[Path]:
+def _iter_source_files(root: Path, exclude_dirs: frozenset[str]) -> list[Path]:
     files = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.suffix not in C_SUFFIXES:
             continue
-        if any(part in EXCLUDE_DIRS for part in path.relative_to(root).parts):
+        if any(part in exclude_dirs for part in path.relative_to(root).parts):
             continue
         files.append(path)
     return files
@@ -94,11 +97,11 @@ def _extract_functions(text: str, rel_path: str) -> list[FunctionInfo]:
     return functions
 
 
-def _extract_build_flags(root: Path) -> list[str]:
+def _extract_build_flags(root: Path, exclude_dirs: frozenset[str]) -> list[str]:
     flags: list[str] = []
     for name in ("Makefile", "CMakeLists.txt", "meson.build"):
         for marker in root.rglob(name):
-            if any(part in EXCLUDE_DIRS for part in marker.relative_to(root).parts):
+            if any(part in exclude_dirs for part in marker.relative_to(root).parts):
                 continue
             try:
                 text = marker.read_text(encoding="utf-8", errors="replace")
@@ -113,15 +116,20 @@ def _extract_build_flags(root: Path) -> list[str]:
 def scan_project(
     project_root: str,
     module_ids: dict[str, str] | None = None,
+    exclude_dirs: Iterable[str] | None = None,
 ) -> ScanResult:
-    """扫描项目为文件级模块；module_ids 为 {相对 .c 路径: 模块标识} 映射。"""
+    """扫描项目为文件级模块；module_ids 为 {相对 .c 路径: 模块标识} 映射。
+
+    exclude_dirs 为要跳过的目录名集合（按路径段匹配）；None 时取 DEFAULT_EXCLUDE_DIRS。
+    """
     root = Path(project_root).resolve()
     if not root.is_dir():
         raise ValueError(f"被测项目目录不存在: {root}")
+    excludes = frozenset(exclude_dirs) if exclude_dirs is not None else DEFAULT_EXCLUDE_DIRS
     logger.info("[S0] 扫描项目 %s", root)
-    logger.debug("[S0] 扫描参数 排除目录=%s", sorted(EXCLUDE_DIRS))
+    logger.debug("[S0] 扫描参数 排除目录=%s", sorted(excludes))
 
-    source_files = _iter_source_files(root)
+    source_files = _iter_source_files(root, excludes)
     rel_paths = {str(p.relative_to(root)) for p in source_files}
     c_paths = sorted(rel for rel in rel_paths if rel.endswith(".c"))
     logger.debug("[S0] 源码文件数=%d .c文件数=%d", len(source_files), len(c_paths))
@@ -141,7 +149,7 @@ def scan_project(
     texts: dict[str, str] = {}
     functions: list[FunctionInfo] = []
     include_edges: list[IncludeEdge] = []
-    build_flags = _extract_build_flags(root)
+    build_flags = _extract_build_flags(root, excludes)
 
     for path in source_files:
         rel = str(path.relative_to(root))

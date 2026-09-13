@@ -18,7 +18,8 @@ def _llm(prompt: str, schema: type, cfg: ReviewConfig, retries: int = 2):
     total_attempts = retries + 1
     for attempt in range(1, retries + 2):
         logger.debug(
-            "[LLM请求] schema=%s attempt=%d/%d prompt_chars=%d profile=%s 首token超时=%.0fs chunk超时=%.0fs",
+            "[LLM请求] schema=%s attempt=%d/%d prompt_chars=%d profile=%s 首token超时=%.0fs chunk超时=%.0fs "
+            "temperature=%s seed=%s",
             schema_name,
             attempt,
             total_attempts,
@@ -26,6 +27,8 @@ def _llm(prompt: str, schema: type, cfg: ReviewConfig, retries: int = 2):
             cfg.model_profile or "(active)",
             cfg.first_token_timeout,
             cfg.chunk_timeout,
+            "条目默认" if cfg.temperature is None else cfg.temperature,
+            cfg.seed if cfg.seed is not None else "未固定",
         )
         started = time.monotonic()
         try:
@@ -35,6 +38,8 @@ def _llm(prompt: str, schema: type, cfg: ReviewConfig, retries: int = 2):
                 profile=cfg.model_profile or None,
                 first_token_timeout=cfg.first_token_timeout,
                 chunk_timeout=cfg.chunk_timeout,
+                temperature=cfg.temperature,
+                seed=cfg.seed,
             )
             logger.debug("[LLM响应] schema=%s attempt=%d 耗时=%.2fs", schema_name, attempt, time.monotonic() - started)
             return result

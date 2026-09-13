@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ...log import get_logger
@@ -29,16 +30,24 @@ def scan_node(state: ReviewState) -> dict[str, Any]:
     scan: ScanResult | None = None
     if persisted.exists():
         scan = ScanResult.model_validate(_read_json(persisted))
-        if all(m.module_id for m in scan.modules):
-            logger.info("[S0] 命中断点，跳过扫描: %s", persisted)
-        else:
+        if not all(m.module_id for m in scan.modules):
             logger.warning("[S0] 扫描产物缺少 module_id（旧格式），重新扫描: %s", persisted)
             scan = None
+        elif Path(scan.project_root) != Path(cfg.project_root):
+            # 断点只比对产物是否「存在」而不比对来源：换一个 --project 复用同一
+            # output_root 时，会把上一个项目的扫描结果当成新项目的，后续所有阶段
+            # 都基于错误的文件清单推进，且完全无声。
+            logger.warning(
+                "[S0] 扫描产物来自其他项目，重新扫描: 产物=%s 当前=%s", scan.project_root, cfg.project_root
+            )
+            scan = None
+        else:
+            logger.info("[S0] 命中断点，跳过扫描: %s", persisted)
     if scan is None:
         modules_map = load_modules_map()
         module_ids = {m.path: m.id for m in modules_map.modules}
         logger.debug("[S0] 模块映射 %s", module_ids)
-        scan = c_scanner.scan_project(cfg.project_root, module_ids)
+        scan = c_scanner.scan_project(cfg.project_root, module_ids, exclude_dirs=cfg.excludes)
         _write_json(persisted, scan.model_dump())
     logger.debug(
         "[S0] 扫描结果 模块=%d 函数=%d include边=%d 调用边=%d 构建参数=%d",
