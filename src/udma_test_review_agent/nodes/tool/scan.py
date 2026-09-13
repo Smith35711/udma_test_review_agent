@@ -9,12 +9,11 @@ from ...module_map import load_modules_map
 from ...schemas import ScanResult
 from ...state import ReviewState
 from ...tools.executors import c_scanner
-from ..common import _config, _module_order, _read_json, _scan_persist_path, _tracked, _write_json
+from ..common import _config, _module_order, _read_json, _scan_persist_path, _write_json
 
 logger = get_logger(__name__)
 
 
-@_tracked("scan")
 def scan_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     persisted = _scan_persist_path(cfg)
@@ -55,4 +54,5 @@ def scan_node(state: ReviewState) -> dict[str, Any]:
         "module_size": {},
         "review_index": 0,
         "module_results": {},
+        "module_failures": {},
     }

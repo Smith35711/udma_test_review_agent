@@ -9,13 +9,13 @@ from ...log import get_logger
 from ...prompts.critical_paths import CRITICAL_PATH_PROMPT
 from ...schemas import CriticalPathReport, ScanResult
 from ...state import ReviewState
-from ..common import _config, _critical_paths_path, _module_order, _read_json, _tracked, _write_json
+from ..common import _config, _critical_paths_path, _module_order, _read_json, _write_json
+
 from ._base import _llm
 
 logger = get_logger(__name__)
 
 
-@_tracked("critical_paths")
 def critical_paths_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     persisted = _critical_paths_path(cfg)

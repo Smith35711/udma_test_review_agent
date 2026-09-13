@@ -10,12 +10,12 @@ from ...schemas import GlobalArchitecture, ModuleArchitecture, ScanResult
 from ...state import ReviewState
 from ...tools.executors import c_scanner
 from ..common import (
+
     _config,
     _global_context_for_module,
     _module_arch_path,
     _module_order,
     _read_json,
-    _tracked,
     _truncate,
     _write_json,
 )
@@ -24,7 +24,6 @@ from ._base import _llm
 logger = get_logger(__name__)
 
 
-@_tracked("module_archs")
 def module_archs_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     scan = ScanResult.model_validate(state["scan"])

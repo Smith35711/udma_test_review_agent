@@ -97,7 +97,6 @@ agent/
 │   └── modules.yaml           # 文件级模块标识映射（M01 → 路径）
 ├── scripts/
 │   ├── run_review.py          # 命令行入口
-│   ├── run_server.py          # Web 服务入口
 │   └── test_single_llm_node.py# 单 LLM 节点示例
 ├── src/udma_test_review_agent/
 │   ├── graph.py               # 图组装与编译（导出 graph）
@@ -107,8 +106,6 @@ agent/
 │   ├── module_map.py          # 模块映射与选择解析
 │   ├── llm.py                 # 唯一 LLM 出口：流式、超时、心跳、schema 校验
 │   ├── log.py                 # 日志：控制台按等级，文件恒 DEBUG
-│   ├── control.py             # 协作式暂停 / 继续 / 取消
-│   ├── server.py              # FastAPI + SSE 事件推送
 │   ├── schemas.py             # 各阶段结构化产物模型（Pydantic）
 │   ├── prompts/               # 提示词子包（按节点拆分）
 │   ├── nodes/
@@ -117,9 +114,7 @@ agent/
 │   │   └── tool/              # 确定性工具节点（扫描 / 跨模块校验 / 尺寸分析 / 反驳审查 / 推进 / 汇总）
 │   └── tools/executors/
 │       └── c_scanner.py       # S0 纯文本 C 扫描器
-├── web/index.html             # 前端：拓扑、节点状态、LLM 流式、日志
-├── pyproject.toml             # 依赖与打包
-└── langgraph.json             # LangGraph Platform 部署声明
+└── pyproject.toml             # 依赖与打包
 ```
 
 ### 产物与版本管理
@@ -145,7 +140,7 @@ agent/
 - 每模块子目录固定保留最新产物，`history/<run_ts>/` 保存历史版本；
 - 上次运行已完成（项目总报告 `report.md` 存在）时，启动前将各模块的 `findings_raw.json`、`findings_verified.json`、`report.md` 归档到 `history/<run_ts>/`，再重新检视；
 - 上次运行未完成（总报告缺失）时视为中断，直接续跑，不归档；
-- 勾选 Web 界面“清产物重跑”或 CLI `--clean`：先归档三阶段产物，再重置其余当前产物（保留 `history/`），触发全量重算；
+- CLI `--clean`：先归档三阶段产物，再重置其余当前产物（保留 `history/`），触发全量重算；
 - 旧版扫描产物（缺少 `module_id`）会自动重新扫描。
 
 ---
@@ -154,32 +149,62 @@ agent/
 
 ### 模型配置（`config/models.yaml`）
 
-列表声明多个模型，`active` 指定默认启用项：
+`active` 指定默认启用项，`defaults` 写跨端点一致的字段，`providers` 写各端点的连接参数，`models` 只写差异：
 
 ```yaml
 active: deepseek-v4.1-flash
 
-models:
-  - name: deepseek-v4.1-flash
-    type: openai
-    model: deepseek-v4.1-flash-expires-on-0910
+defaults:                  # 所有模型的公共默认值（可选）
+  type: openai
+  temperature: 0.7
+  max_retries: 2
+  timeout: 60
+
+providers:                 # 同一端点的公共连接参数（可选）
+  deepseek:
     base_url: https://api.deepseek.com
     api_key: ${DEEPSEEK_API_KEY}
-    temperature: 0.7
-    max_retries: 2
-    timeout: 60
+  opencode:
+    base_url: https://opencode.ai/zen/go/v1
+    api_key: ${OPENCODE_API_KEY}
+
+models:
+  - {name: deepseek-v4.1-flash, provider: deepseek, model: deepseek-v4.1-flash-expires-on-0910}
+  - {name: deepseek-chat,       provider: deepseek, model: deepseek-chat}
+  - {name: glm-5.3-flash,       provider: opencode, model: glm-5.3-flash}
 ```
 
-字段：`name` 唯一名称、`type` 模型类型（当前支持 `openai`，即 OpenAI 兼容端点）、`model` 供应商模型标识、`base_url`、`api_key`（字面量或 `${ENV_VAR}`，支持 `${ENV_VAR:-默认值}`）、`temperature`、`max_retries`、`timeout`、`extra_headers`（可选）。
+**取值分层**，优先级由低到高：模型条目内置默认值 → `defaults` → `providers.<名>` → `models[]` 条目。即下层写公共字段，上层只写差异。
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 唯一名称，供切换时引用；`active`、`--model`、`LLM_PROFILE` 均填此名，**不是 provider 名** |
+| `model` | 传给供应商的模型标识（必填） |
+| `provider` | 引用 `providers` 中的键（可选，省略即为旧格式条目） |
+| `type` | 模型类型，当前支持 `openai`（OpenAI 兼容端点） |
+| `base_url` | API Base URL（合并后仍必填） |
+| `api_key` | 密钥：字面量或 `${ENV_VAR}`，支持 `${ENV_VAR:-默认值}` |
+| `temperature` / `max_retries` / `timeout` | 采样温度（0.7）/ 重试次数（2）/ 超时秒数（60） |
+| `extra_headers` | 附加请求头（可选） |
+
+合并规则：
+
+- `defaults` 与 `providers.<名>` 只接受上表中的 `type`、`base_url`、`api_key`、`temperature`、`max_retries`、`timeout`、`extra_headers`；写入 `provider` / `name` / `model` 会直接报错（否则会给所有条目静默注入）。
+- **空值一律视为「未填写」**，沿用下层取值（`timeout:` 与 `timeout: ""` 均不会清掉下层配置）；`extra_headers` 按**键**浅合并，同名键由上层覆盖、下层其余键保留，其余字段整体覆盖。
+- 迁移成本：新增模型只需追加 `{name, provider, model}` 一行；换密钥或改 endpoint 只动 `providers` 一处。
+- **向后兼容**：不含 `provider` 键的条目即旧格式，可与新格式混用；旧配置文件（无 `providers` / `defaults`）行为完全不变。旧格式条目同样会继承 `defaults`。
 
 切换优先级（高到低）：
 
 1. 命令行 `--model NAME`
-2. Web 界面“模型”下拉框
-3. 环境变量 `LLM_PROFILE`
-4. 配置文件 `active`
+2. 环境变量 `LLM_PROFILE`
+3. 配置文件 `active`
 
-新增模型只需在列表中追加条目，无需改代码。
+当前生效项与全部可选模型可用 `--list-models` 查看（配置有误时单行中文报错 + 退出码 1，不打印 traceback）：
+
+```bash
+.venv/bin/python scripts/run_review.py --list-models
+```
 
 ### 模块配置（`config/modules.yaml`）
 
@@ -200,7 +225,7 @@ modules:
 | 变量 | 说明 |
 | --- | --- |
 | `DEEPSEEK_API_KEY` / `OPENCODE_API_KEY` | 供 `models.yaml` 中 `${...}` 引用 |
-| `LLM_PROFILE` | 覆盖当前启用模型 |
+| `LLM_PROFILE` | 覆盖当前启用模型，填**模型 `name`**（如 `deepseek-chat`），不是 provider 名 |
 | `MODEL_CONFIG` | 自定义模型配置文件路径（默认 `config/models.yaml`） |
 | `MODULES_CONFIG` | 自定义模块映射文件路径（默认 `config/modules.yaml`） |
 | `LOG_LEVEL` | 控制台日志等级（默认 `INFO`） |
@@ -222,9 +247,10 @@ modules:
 
 | 参数 | 说明 |
 | --- | --- |
-| `--project` | 被测 C 项目根目录（必填） |
+| `--project` | 被测 C 项目根目录（跑评审时必填；仅使用 `--list-models` 时可省略） |
 | `--modules` | 模块选择，见下（默认 `all`） |
 | `--model` | 模型配置名（`config/models.yaml` 中的 `name`），留空取 `active` |
+| `--list-models` | 列出全部可选模型、当前生效项与密钥是否已配置，随后退出（无需 `--project`；不打印密钥本体） |
 | `--small-line-threshold` | 小模块行数阈值（模块 `.c` 与 `.h` 物理行数之和，默认 2000；`≤` 阈值走小模块分支） |
 | `--output-root` | 产物输出目录（默认 `output/review`） |
 | `--clean` | 清产物重跑：先归档三阶段产物，再全量重算 |
@@ -239,27 +265,6 @@ modules:
 | `M01,M03` | 多个模块 |
 | `M01-M05` | 区间（按标识顺序） |
 | `M01-M03,M08` | 区间与单个组合 |
-
-### Web 服务
-
-```bash
-.venv/bin/python scripts/run_server.py
-```
-
-浏览器打开 `http://127.0.0.1:8765`，可查看拓扑、节点状态、当前 LLM 流式内容与日志，并支持启动 / 暂停 / 继续 / 停止 / 重启，以及模型与模块选择。
-
-主要接口：
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `POST` | `/api/run` | 启动（`project` / `modules` / `model` / `small_line_threshold` / `clean`） |
-| `POST` | `/api/pause`、`/api/resume`、`/api/cancel`、`/api/restart` | 运行控制 |
-| `GET` | `/api/graph` | 拓扑定义 |
-| `GET` | `/api/models` | 可用模型与默认项 |
-| `GET` | `/api/status` | 运行状态 |
-| `GET` | `/api/events` | SSE 事件流（节点 / LLM 流式 / 日志） |
-
----
 
 ## 日志
 

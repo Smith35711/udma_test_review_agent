@@ -9,13 +9,13 @@ from ...log import get_logger
 from ...prompts.global_arch import GLOBAL_ARCH_PROMPT
 from ...schemas import GlobalArchitecture, ScanResult
 from ...state import ReviewState
-from ..common import _config, _global_arch_path, _read_json, _tracked, _write_json
+from ..common import _config, _global_arch_path, _read_json, _write_json
+
 from ._base import _llm
 
 logger = get_logger(__name__)
 
 
-@_tracked("global_arch")
 def global_arch_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     persisted = _global_arch_path(cfg)

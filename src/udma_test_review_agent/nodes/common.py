@@ -1,14 +1,13 @@
-"""节点通用辅助：事件发布、生命周期装饰器、配置与产物路径、JSON 读写、统计。"""
+"""节点通用辅助：配置与产物路径、JSON 读写、统计。"""
 
 from __future__ import annotations
 
 import json
-from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..configuration import ReviewConfig
-from ..control import run_control
 from ..log import get_logger
 from ..module_map import id_sort_key, parse_selection
 from ..schemas import GlobalArchitecture, ScanResult
@@ -17,39 +16,91 @@ from ..state import ReviewState
 logger = get_logger(__name__)
 
 
-def _emit(event: dict[str, Any]) -> None:
-    """向流式消费者发布自定义事件；无消费者时静默。"""
-    try:
-        from langgraph.config import get_stream_writer
-
-        get_stream_writer()(event)
-    except Exception:  # noqa: BLE001 - 非流式调用无 writer
-        pass
-
-
-def _tracked(name: str):
-    """节点装饰器：发布 start/done/error 生命周期事件。"""
-
-    def deco(func):
-        @wraps(func)
-        def wrapper(state: ReviewState) -> dict[str, Any]:
-            run_control.checkpoint()
-            _emit({"type": "node", "name": name, "status": "start"})
-            try:
-                result = func(state)
-            except Exception as exc:
-                _emit({"type": "node", "name": name, "status": "error", "message": str(exc)[:300]})
-                raise
-            _emit({"type": "node", "name": name, "status": "done"})
-            return result
-
-        return wrapper
-
-    return deco
-
-
 def _config(state: ReviewState) -> ReviewConfig:
     return ReviewConfig(**state["config"])
+
+
+_AUTO_PARALLEL = 8
+"""并发数配置为 0（自动）时的实际并发上限。"""
+
+
+def _max_parallel(state: ReviewState) -> int:
+    """模块循环的并发上限：读 state["config"]["max_parallel"]；0 或非法值回退 _AUTO_PARALLEL。"""
+    raw = (state.get("config") or {}).get("max_parallel", 0)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _AUTO_PARALLEL
+    return value if value > 0 else _AUTO_PARALLEL
+
+
+def _batch(state: ReviewState) -> list[str]:
+    """当前批次的模块切片（纯切片，**不**按失败模块过滤）。
+
+    契约：六个循环节点与 `advance` 必须共用本函数，且**只有 `advance` 可以写
+    `review_index`**；否则同一轮迭代内各节点会看到不同的批次。
+
+    必须是纯切片：`advance` 按 `len(_batch(state))` 步进，若此处滤掉已失败模块，
+    整批都失败时步长为 0，图将死循环。跳过失败模块是执行期（`_execute_batch`）的职责。
+    """
+    index = state.get("review_index", 0)
+    order = state.get("module_order") or []
+    return list(order[index : index + _max_parallel(state)])
+
+
+def _execute_batch(
+    node: str,
+    state: ReviewState,
+    run_one: Callable[[str], dict[str, Any]],
+    *,
+    channel: str | None,
+) -> dict[str, Any]:
+    """执行当前批次的模块：按模块隔离失败，并合并为**一次**状态写入。
+
+    `run_one(module)` 返回 `{channel: {module: value}}`（`channel` 为 None 时返回 `{}`）。
+    有效并发 <= 1 时在调用线程内联执行（不建线程池）；否则用线程池。
+    单个模块抛异常只记入 `module_failures` 并继续其余模块，不中断整轮。
+    """
+    existing = dict(state.get("module_failures") or {})
+    pending = [module for module in _batch(state) if module not in existing]
+
+    def _run(module: str) -> tuple[str, dict[str, Any], Exception | None]:
+        try:
+            return module, run_one(module), None
+        except Exception as exc:  # noqa: BLE001 - 单模块失败不终止整轮
+            return module, {}, exc
+
+    workers = min(_max_parallel(state), len(pending))
+    logger.debug(
+        "[%s] 批次=%s 待处理=%d 并发=%d", node, _batch(state), len(pending), workers
+    )
+    outcomes: list[tuple[str, dict[str, Any], Exception | None]] = []
+    if workers <= 1:
+        outcomes = [_run(module) for module in pending]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"mr-{node}") as pool:
+            futures = [pool.submit(_run, module) for module in pending]
+            # 按提交序取回，使合并与失败日志的顺序确定（完成时序仍不确定）
+            outcomes = [future.result() for future in futures]
+
+    merged: dict[str, Any] = {}
+    failures: dict[str, str] = {}
+    for module, fragment, exc in outcomes:
+        if exc is not None:
+            detail = f"{node}: {type(exc).__name__}: {exc}"
+            failures[module] = detail
+            # 统一由驱动线程记录，保证堆栈完整、顺序确定
+            logger.error("[%s] 模块 %s 失败: %s（跳过该模块后续阶段）", node, module, detail, exc_info=exc)
+            continue
+        if channel:
+            merged.update(fragment.get(channel) or {})
+
+    result: dict[str, Any] = {}
+    if channel and merged:
+        result[channel] = merged
+    if failures:
+        result["module_failures"] = {**existing, **failures}
+    return result
 
 
 def _output_dir(cfg: ReviewConfig, module: str = "") -> Path:

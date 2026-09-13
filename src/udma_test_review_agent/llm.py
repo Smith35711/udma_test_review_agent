@@ -208,7 +208,6 @@ def stream_llm_once(
     first_token_timeout: float = LLM_FIRST_TOKEN_TIMEOUT,
     chunk_timeout: float = LLM_CHUNK_TIMEOUT,
     include_reasoning: bool = False,
-    observer: object = None,
 ) -> str | tuple[str, str] | BaseModel:
     """唯一 LLM 对外接口：内部流式接收，外部一次性返回。
 
@@ -219,19 +218,11 @@ def stream_llm_once(
     schema 为 None 时返回正文 str（include_reasoning 为 True 时返回
     (思维链, 正文) 二元组）；
     schema 为 Pydantic 模型时启用 JSON 结构化输出，返回校验后的实例。
-    observer 为可选回调 (kind, data)，接收 request/chunk/done 事件。
     profile 指定模型配置中的 name；为空时依 LLM_PROFILE 环境变量或配置 active。
     """
     spec = resolve_model(profile)
     model = model or spec.model
     base_url = base_url or spec.base_url
-
-    def _notify(kind: str, data: dict) -> None:
-        if observer is not None:
-            try:
-                observer(kind, data)
-            except Exception:  # noqa: BLE001 - 观察者异常不影响主流程
-                pass
 
     response_format = None
     if schema is not None:
@@ -256,14 +247,6 @@ def stream_llm_once(
         first_token_timeout,
         chunk_timeout,
     )
-    _notify("request", {
-        "model": model,
-        "schema": schema.__name__ if schema else None,
-        "prompt_digest": _prompt_digest(prompt),
-        "prompt_chars": len(prompt),
-        "first_token_timeout": first_token_timeout,
-        "chunk_timeout": chunk_timeout,
-    })
 
     client = _build_client(spec, base_url=base_url)
     events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -358,22 +341,14 @@ def stream_llm_once(
             _emit_heartbeat(now)
         if delta_reasoning:
             reasoning_parts.append(delta_reasoning)
-            _notify("chunk", {"phase": "reasoning", "text": delta_reasoning})
         if delta_content:
             content_parts.append(delta_content)
-            _notify("chunk", {"phase": "content", "text": delta_content})
         if usage is None:
             usage = getattr(payload, "usage", None)
 
     text = "".join(content_parts)
     reasoning_text = "".join(reasoning_parts)
     elapsed = time.monotonic() - start
-    _notify("done", {
-        "elapsed": round(elapsed, 3),
-        "reasoning_chars": len(reasoning_text),
-        "content_chars": len(text),
-        "total_tokens": usage.total_tokens if usage is not None else None,
-    })
     total = len(reasoning_text) + len(text)
     reasoning_pct = round(len(reasoning_text) * 100 / total) if total else 0
     if usage is not None:

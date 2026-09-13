@@ -25,11 +25,11 @@ from ...state import ReviewState
 from ...tools.executors import c_scanner
 from ..common import (
     _config,
+    _execute_batch,
     _findings_raw_path,
     _global_context_for_module,
     _module_arch_path,
     _read_json,
-    _tracked,
     _truncate,
     _write_json,
 )
@@ -191,17 +191,13 @@ def _review_module_raw(
     return RawFindings(findings=final_findings, observations=observations).model_dump()
 
 
-@_tracked("review_module")
-def review_module_node(state: ReviewState) -> dict[str, Any]:
-    cfg = _config(state)
-    scan = ScanResult.model_validate(state["scan"])
-    global_arch = GlobalArchitecture.model_validate(state["global_arch"])
-    index = state.get("review_index", 0)
-    order = state["module_order"]
-    module = order[index]
-    size_info = (state.get("module_size") or {}).get(module) or {}
-    size_class = size_info.get("size_class") or "large"
-
+def _review_one(
+    cfg: ReviewConfig,
+    scan: ScanResult,
+    global_arch: GlobalArchitecture,
+    module: str,
+    size_class: str,
+) -> dict[str, Any]:
     if _findings_raw_path(cfg, module).exists():
         logger.info("[检视] 命中断点: %s", module)
         return {"module_raw": {module: _read_json(_findings_raw_path(cfg, module))}}
@@ -211,3 +207,16 @@ def review_module_node(state: ReviewState) -> dict[str, Any]:
     _write_json(_findings_raw_path(cfg, module), data)
     logger.info("[检视] %s 完成，耗时 %.1fs", module, time.monotonic() - started)
     return {"module_raw": {module: data}}
+
+
+def review_module_node(state: ReviewState) -> dict[str, Any]:
+    cfg = _config(state)
+    scan = ScanResult.model_validate(state["scan"])
+    global_arch = GlobalArchitecture.model_validate(state["global_arch"])
+    sizes = state.get("module_size") or {}
+
+    def _run(module: str) -> dict[str, Any]:
+        size_class = (sizes.get(module) or {}).get("size_class") or "large"
+        return _review_one(cfg, scan, global_arch, module, size_class)
+
+    return _execute_batch("review_module", state, _run, channel="module_raw")

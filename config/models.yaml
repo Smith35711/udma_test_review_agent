@@ -1,54 +1,65 @@
 # 模型配置文件
 #
-# active: 当前启用的模型 name；亦可用环境变量 LLM_PROFILE 或 CLI/接口参数临时覆盖。
-# models: 模型列表，每项字段说明：
-#   name           唯一名称，供切换时引用
-#   type           模型类型，当前支持 openai（OpenAI 兼容端点）
+# 分层取值，优先级由低到高：模型条目内置默认值 < defaults < providers.<名> < models[] 条目。
+# 即：下层写公共字段，上层只写差异。
+#
+# defaults            所有模型的公共默认值（可选）。可写字段：type、temperature、max_retries、
+#                     timeout、extra_headers、base_url、api_key。
+# providers.<名>      同一端点的公共连接参数（可选）。可写字段同 defaults。
+#                     注意：provider / name / model 不可写在 defaults 或 provider 块内。
+# models[]            模型条目，必填 name 与 model，其余省略即继承 defaults 与 provider。
+#
+# 各字段含义：
+#   name           唯一名称，供切换时引用；active、--model、LLM_PROFILE 均填此名，不是 provider 名
 #   model          传给供应商的模型标识
+#   provider       引用 providers 中的键；省略即旧格式条目，须自行提供 base_url 等必填字段
+#   type           模型类型，当前支持 openai（OpenAI 兼容端点）
 #   base_url       API Base URL
-#   api_key        密钥：可写字面量，或写 ${ENV_VAR} 从环境变量读取，支持 ${ENV_VAR:-默认值}
+#   api_key        密钥：写 ${ENV_VAR} 从环境变量读取，支持 ${ENV_VAR:-默认值}
 #   temperature    采样温度，默认 0.7
 #   max_retries    失败重试次数，默认 2（用于 create_llm）
 #   timeout        请求超时秒数，默认 60（用于 create_llm）
-#   extra_headers  附加请求头（可选）
+#   extra_headers  附加请求头（可选）；与下层按「键」合并，本层同名键优先
 #
-# 新增模型：复制一份条目并修改字段即可，无需改动代码。
+# 空值（如 `timeout:`）视为「未填写」，沿用下层取值；extra_headers 按键浅合并，
+# 其余字段整体覆盖。合并后的最终取值可用 `.venv/bin/python scripts/run_review.py --list-models` 查看。
+#
+# 新增模型：在 models 追加一个条目，填写 provider 与 model 即可，无需改动代码。
+# 新增供应商：在 providers 追加一个块，供多个模型条目共用。
+#
+# 兼容性：不含 provider 字段的条目即为旧格式，可直接与本格式混用；
+#        未声明 providers / defaults 块的旧配置文件行为完全不变。
 
 active: deepseek-v4.1-flash
 
-models:
-  - name: deepseek-v4.1-flash
-    type: openai
-    model: deepseek-v4.1-flash-expires-on-0910
+defaults:
+  type: openai
+  temperature: 0.7
+  max_retries: 2
+  timeout: 60
+
+providers:
+  deepseek:
     base_url: https://api.deepseek.com
     api_key: ${DEEPSEEK_API_KEY}
-    temperature: 0.7
-    max_retries: 2
-    timeout: 60
 
-  - name: deepseek-chat
-    type: openai
-    model: deepseek-chat
-    base_url: https://api.deepseek.com
-    api_key: ${DEEPSEEK_API_KEY}
-    temperature: 0.7
-    max_retries: 2
-    timeout: 60
-
-  - name: deepseek-reasoner
-    type: openai
-    model: deepseek-reasoner
-    base_url: https://api.deepseek.com
-    api_key: ${DEEPSEEK_API_KEY}
-    temperature: 0.7
-    max_retries: 2
-    timeout: 60
-
-  - name: glm-5.3-flash
-    type: openai
-    model: glm-5.3-flash
+  opencode:
     base_url: https://opencode.ai/zen/go/v1
     api_key: ${OPENCODE_API_KEY}
-    temperature: 0.7
-    max_retries: 2
-    timeout: 60
+
+models:
+  - name: deepseek-v4.1-flash
+    provider: deepseek
+    model: deepseek-v4.1-flash-expires-on-0910
+
+  - name: deepseek-chat
+    provider: deepseek
+    model: deepseek-chat
+
+  - name: deepseek-reasoner
+    provider: deepseek
+    model: deepseek-reasoner
+
+  - name: glm-5.3-flash
+    provider: opencode
+    model: glm-5.3-flash

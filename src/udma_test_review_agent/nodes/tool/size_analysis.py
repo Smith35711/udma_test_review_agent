@@ -4,20 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...configuration import ReviewConfig
 from ...log import get_logger
 from ...schemas import ModuleSize, ScanResult
 from ...state import ReviewState
-from ..common import _config, _module_size_path, _read_json, _tracked, _write_json
+from ..common import _config, _execute_batch, _module_size_path, _read_json, _write_json
 
 logger = get_logger(__name__)
 
 
-@_tracked("size_analysis")
-def size_analysis_node(state: ReviewState) -> dict[str, Any]:
-    cfg = _config(state)
-    scan = ScanResult.model_validate(state["scan"])
-    module = state["module_order"][state.get("review_index", 0)]
-
+def _size_analysis_one(cfg: ReviewConfig, scan: ScanResult, module: str) -> dict[str, Any]:
     persisted = _module_size_path(cfg, module)
     if persisted.exists():
         data = _read_json(persisted)
@@ -46,3 +42,11 @@ def size_analysis_node(state: ReviewState) -> dict[str, Any]:
         persisted,
     )
     return {"module_size": {module: size.model_dump()}}
+
+
+def size_analysis_node(state: ReviewState) -> dict[str, Any]:
+    cfg = _config(state)
+    scan = ScanResult.model_validate(state["scan"])
+    return _execute_batch(
+        "size_analysis", state, lambda module: _size_analysis_one(cfg, scan, module), channel="module_size"
+    )

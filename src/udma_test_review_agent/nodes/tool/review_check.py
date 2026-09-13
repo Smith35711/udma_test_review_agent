@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...configuration import ReviewConfig
 from ...log import get_logger
 from ...schemas import RawFindings
 from ...state import ReviewState
 from ..common import (
     _config,
+    _execute_batch,
     _findings_raw_path,
     _findings_verified_path,
     _read_json,
     _stats,
-    _tracked,
     _write_json,
 )
 
@@ -35,10 +36,7 @@ def _fallback_verdict(finding: dict[str, Any], reason: str) -> dict[str, Any]:
     }
 
 
-@_tracked("review_check")
-def review_check_node(state: ReviewState) -> dict[str, Any]:
-    cfg = _config(state)
-    module = state["module_order"][state.get("review_index", 0)]
+def _review_check_one(cfg: ReviewConfig, state: ReviewState, module: str) -> dict[str, Any]:
     payload = dict(state["module_results"][module])
 
     raw = RawFindings.model_validate(_read_json(_findings_raw_path(cfg, module)))
@@ -78,3 +76,10 @@ def review_check_node(state: ReviewState) -> dict[str, Any]:
         _findings_verified_path(cfg, module),
     )
     return {"module_results": {module: payload}}
+
+
+def review_check_node(state: ReviewState) -> dict[str, Any]:
+    cfg = _config(state)
+    return _execute_batch(
+        "review_check", state, lambda module: _review_check_one(cfg, state, module), channel="module_results"
+    )

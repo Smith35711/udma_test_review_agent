@@ -9,12 +9,10 @@ from typing import Any
 from ...log import get_logger
 from ...schemas import ScanResult
 from ...state import ReviewState
-from ..common import _tracked
 
 logger = get_logger(__name__)
 
 
-@_tracked("merge")
 def merge_node(state: ReviewState) -> dict[str, Any]:
     scan = ScanResult.model_validate(state["scan"])
     defined = {f.name for f in scan.functions}

@@ -12,11 +12,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ...configuration import ReviewConfig
 from ...llm import stream_llm_once
 from ...log import get_logger
 from ...prompts.report import REPORT_SUMMARY_PROMPT
 from ...state import ReviewState
-from ..common import _config, _module_dir, _tracked, _truncate
+from ..common import _config, _execute_batch, _module_dir, _truncate
 
 logger = get_logger(__name__)
 
@@ -159,10 +160,7 @@ def render_module_report(
     return "\n".join(lines)
 
 
-@_tracked("module_report")
-def module_report_node(state: ReviewState) -> dict[str, Any]:
-    cfg = _config(state)
-    module = state["module_order"][state.get("review_index", 0)]
+def _module_report_one(cfg: ReviewConfig, state: ReviewState, module: str) -> dict[str, Any]:
     report_path = _module_dir(cfg, module) / "report.md"
     if report_path.exists():
         logger.info("[模块报告] 命中断点: %s", module)
@@ -187,3 +185,11 @@ def module_report_node(state: ReviewState) -> dict[str, Any]:
     report_path.write_text(module_md, encoding="utf-8")
     logger.info("[模块报告] %s 完成 耗时%.1fs 产物=%s", module, time.monotonic() - started, report_path)
     return {}
+
+
+def module_report_node(state: ReviewState) -> dict[str, Any]:
+    """本节点无状态产物（只写文件），故 channel=None。"""
+    cfg = _config(state)
+    return _execute_batch(
+        "module_report", state, lambda module: _module_report_one(cfg, state, module), channel=None
+    )

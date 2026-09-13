@@ -6,6 +6,7 @@ import json
 import time
 from typing import Any
 
+from ...configuration import ReviewConfig
 from ...log import get_logger
 from ...prompts.rebuttal import REBUTTAL_BATCH_PROMPT
 from ...schemas import Finding, RawFindings, RebuttalReport, ScanResult, Verdict
@@ -13,10 +14,10 @@ from ...state import ReviewState
 from ...tools.executors import c_scanner
 from ..common import (
     _config,
+    _execute_batch,
     _findings_verified_path,
     _read_json,
     _stats,
-    _tracked,
     _truncate,
 )
 from ._base import _llm
@@ -71,13 +72,9 @@ def _fallback_verdict(finding: Finding) -> Verdict:
     )
 
 
-@_tracked("rebuttal_module")
-def rebuttal_module_node(state: ReviewState) -> dict[str, Any]:
-    cfg = _config(state)
-    scan = ScanResult.model_validate(state["scan"])
-    index = state.get("review_index", 0)
-    module = state["module_order"][index]
-
+def _rebuttal_one(
+    cfg: ReviewConfig, scan: ScanResult, state: ReviewState, module: str
+) -> dict[str, Any]:
     verified_path = _findings_verified_path(cfg, module)
     if verified_path.exists():
         logger.info("[反驳] 命中断点: %s", module)
@@ -130,3 +127,14 @@ def rebuttal_module_node(state: ReviewState) -> dict[str, Any]:
         verdict = verdicts[finding.id]
         logger.debug("[反驳] %s %s -> %s (置信度%.2f)", module, finding.id, verdict.conclusion, verdict.confidence)
     return {"module_results": {module: payload}}
+
+
+def rebuttal_module_node(state: ReviewState) -> dict[str, Any]:
+    cfg = _config(state)
+    scan = ScanResult.model_validate(state["scan"])
+    return _execute_batch(
+        "rebuttal_module",
+        state,
+        lambda module: _rebuttal_one(cfg, scan, state, module),
+        channel="module_results",
+    )

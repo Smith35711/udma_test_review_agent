@@ -14,23 +14,34 @@ from ..common import (
     _output_dir,
     _read_json,
     _stats,
-    _tracked,
 )
 
 logger = get_logger(__name__)
 
 
-@_tracked("report")
 def report_node(state: ReviewState) -> dict[str, Any]:
     cfg = _config(state)
     started = time.monotonic()
     order = state["module_order"]
+    # 循环内失败的模块在 state 中留痕；本节点兜底把「无有效产物」的模块也归入其中，
+    # 否则读不到 findings_verified.json 会抛 FileNotFoundError 使整轮中止（失败隔离失效）。
+    failures = dict(state.get("module_failures") or {})
     sections = []
     stats_rows = []
     total = {"confirmed": 0, "refuted": 0, "uncertain": 0, "observations": 0}
     for module in order:
-        payload = _read_json(_findings_verified_path(cfg, module))
-        counts = _stats(payload["results"], len(payload.get("observations", [])))
+        if module in failures:
+            logger.warning("[报告] %s 评审失败，未计入统计: %s", module, failures[module])
+            continue
+        try:
+            payload = _read_json(_findings_verified_path(cfg, module))
+            counts = _stats(payload["results"], len(payload.get("observations", [])))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # 阶段未报错却无有效产物（被中断或写入截断），按失败处理而非中止整轮
+            detail = f"report: {type(exc).__name__}: {exc}"
+            failures[module] = detail
+            logger.error("[报告] %s 产物不可用: %s", module, detail, exc_info=exc)
+            continue
         for key in total:
             total[key] += counts.get(key, 0)
         stats_rows.append(
@@ -63,6 +74,8 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         f"合计: confirmed={total['confirmed']} refuted={total['refuted']} uncertain={total['uncertain']} observations={total['observations']}",
         "",
     ]
+    if failures:
+        overall += [f"> 注意：{len(failures)}/{len(order)} 个模块评审失败，未计入上述统计。", ""]
     if state.get("cross_module_candidates"):
         overall += ["## 跨模块候选（S4 预登记，待人工确认）", ""]
         for item in state["cross_module_candidates"]:
@@ -70,6 +83,10 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         overall += [""]
     for section in sections:
         overall.append(section)
+    if failures:
+        overall += ["", "## 未完成模块（评审失败）", "", "| 模块 | 原因 |", "|---|---|"]
+        overall += [f"| {module} | {reason} |" for module, reason in sorted(failures.items())]
+        overall += [""]
     report_text = "\n".join(overall)
     report_path = _output_dir(cfg) / "report.md"
     report_path.write_text(report_text, encoding="utf-8")
@@ -82,4 +99,7 @@ def report_node(state: ReviewState) -> dict[str, Any]:
         total["refuted"],
         total["uncertain"],
     )
+    if failures:
+        logger.error("[报告] %d/%d 个模块评审失败: %s", len(failures), len(order), sorted(failures))
+        return {"report_path": str(report_path), "module_failures": failures}
     return {"report_path": str(report_path)}

@@ -18,3 +18,7 @@ class ReviewState(TypedDict, total=False):
     review_index: int
     module_results: dict[str, Any]
     report_path: str
+    # 检视失败的模块 -> "<节点>: <异常类型>: <消息>"。必须在此声明：
+    # LangGraph 会静默丢弃未声明的状态键，漏声明则失败隔离形同虚设且无任何报错。
+    # 无 reducer，故由各节点读改写整个 dict 累积（同 module_archs 模式）。
+    module_failures: dict[str, str]
