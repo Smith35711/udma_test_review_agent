@@ -1,0 +1,15 @@
+[project]
+name = "agent2"
+version = "0.1.0"
+description = "公共基础设施：模型调用、日志、模型配置"
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "langgraph>=1.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = {find = {where = ["src"]}}
